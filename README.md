@@ -132,7 +132,7 @@ CREATE TABLE media (
 
 ### Voraussetzungen (Arch Linux)
 ```bash
-sudo pacman -S cmake gcc sdl2 sqlite curl libsidplayfp fftw libsamplerate gvfs
+sudo pacman -S cmake gcc sdl2 sqlite curl libsidplayfp fftw libsamplerate gvfs openvino
 ```
 
 ### Kompilieren
