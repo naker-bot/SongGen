@@ -22,8 +22,9 @@ struct MediaMetadata {
     float duration = 0.0f;
     
     // Stil-Kategorisierung
-    std::string genre;        // Trap, Techno, Rock, Pop, Klassik, Metal, New Metal, Trance, etc.
+    std::string genre;        // Primäres Genre: Trap, Techno, Rock, Pop, Klassik, Metal, New Metal, Trance, etc.
     std::string subgenre;
+    std::string genreTags;    // 🎭 Multi-Genre: "Breakbeat,BigBeat,Electronic,Industrial" (comma-separated)
     
     // Charakteristiken
     std::string intensity;    // hart, soft
@@ -100,6 +101,7 @@ public:
     std::vector<MediaMetadata> getAllSortedByGenre();
     std::vector<MediaMetadata> getAllSortedByBPM();
     std::vector<MediaMetadata> getAllSortedByMood();
+    std::vector<MediaMetadata> getAllSortedByLastModified();  // Zuletzt korrigierte zuerst
     std::vector<MediaMetadata> getPlayableByCategory(const std::string& category);
     
     // Playlist-Ready: Gruppiert nach Kategorien

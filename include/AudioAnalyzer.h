@@ -72,6 +72,30 @@ public:
     std::string detectMusicalStyle(const MediaMetadata& meta);
     std::vector<std::string> extractStyleTags(const MediaMetadata& meta);
     
+    // 🎵 Song-Struktur-Analyse
+    struct SongSection {
+        std::string type;           // "intro", "verse", "chorus", "bridge", "outro", "break", "solo"
+        float startTime;            // Sekunden
+        float endTime;              // Sekunden
+        float energy;               // 0.0-1.0
+        float spectralChange;       // Veränderung zum vorherigen Abschnitt
+        std::vector<std::string> instruments;  // Aktive Instrumente
+        bool hasVocals;
+        int repetitionIndex;        // 0=erstes Mal, 1=zweite Wiederholung, etc.
+    };
+    
+    struct SongStructure {
+        std::vector<SongSection> sections;
+        float totalDuration;
+        std::string arrangement;    // z.B. "AABA", "Verse-Chorus-Verse-Chorus-Bridge-Chorus"
+        int numVariations;          // Wie viele verschiedene Teile
+        float complexityScore;      // 0.0-1.0
+        std::map<std::string, int> sectionCounts;  // Wie oft jeder Typ vorkommt
+    };
+    
+    SongStructure analyzeSongStructure(const std::vector<float>& samples, int sampleRate, float bpm);
+    void learnStructurePatterns(const std::vector<SongStructure>& structures, const std::string& genre);
+    
     // Automatische Sortierung
     struct SortCategory {
         std::string name;

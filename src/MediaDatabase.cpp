@@ -52,6 +52,7 @@ bool MediaDatabase::initialize() {
             duration REAL DEFAULT 0.0,
             genre TEXT,
             subgenre TEXT,
+            genreTags TEXT,
             intensity TEXT,
             bassLevel TEXT,
             mood TEXT,
@@ -113,6 +114,7 @@ bool MediaDatabase::initialize() {
     const char* migrationSQL = R"(
         ALTER TABLE training_decisions ADD COLUMN answered INTEGER DEFAULT 0;
         ALTER TABLE training_decisions ADD COLUMN audioFile TEXT;
+        ALTER TABLE media ADD COLUMN genreTags TEXT;
     )";
     
     // Execute migration (ignore errors if columns already exist)
@@ -331,7 +333,60 @@ std::vector<std::string> MediaDatabase::getAllGenres() {
 }
 
 bool MediaDatabase::updateMedia(const MediaMetadata& meta) {
-    return addMedia(meta);  // INSERT OR REPLACE
+    std::lock_guard<std::mutex> lock(dbMutex_);
+    
+    const char* sql = R"(
+        UPDATE media SET
+            title = ?, artist = ?, bpm = ?, duration = ?, genre = ?, subgenre = ?,
+            intensity = ?, bassLevel = ?, mood = ?, instruments = ?, melodySignature = ?,
+            rhythmPattern = ?, spectralCentroid = ?, spectralRolloff = ?, zeroCrossingRate = ?,
+            mfccHash = ?, analyzed = ?
+        WHERE filepath = ?
+    )";
+    
+    sqlite3_stmt* stmt = prepareStatement(sql);
+    if (!stmt) {
+        std::cerr << "❌ Fehler beim Vorbereiten des UPDATE Statements!" << std::endl;
+        return false;
+    }
+    
+    sqlite3_bind_text(stmt, 1, meta.title.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, meta.artist.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(stmt, 3, meta.bpm);
+    sqlite3_bind_double(stmt, 4, meta.duration);
+    sqlite3_bind_text(stmt, 5, meta.genre.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 6, meta.subgenre.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 7, meta.intensity.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 8, meta.bassLevel.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 9, meta.mood.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 10, meta.instruments.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 11, meta.melodySignature.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 12, meta.rhythmPattern.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(stmt, 13, meta.spectralCentroid);
+    sqlite3_bind_double(stmt, 14, meta.spectralRolloff);
+    sqlite3_bind_double(stmt, 15, meta.zeroCrossingRate);
+    sqlite3_bind_double(stmt, 16, meta.mfccHash);
+    sqlite3_bind_int(stmt, 17, meta.analyzed ? 1 : 0);
+    sqlite3_bind_text(stmt, 18, meta.filepath.c_str(), -1, SQLITE_TRANSIENT);
+    
+    int rc = sqlite3_step(stmt);
+    
+    if (rc != SQLITE_DONE) {
+        std::cerr << "❌ SQLite Fehler beim UPDATE: " << sqlite3_errmsg(db_) << " (Code: " << rc << ")" << std::endl;
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    
+    int changedRows = sqlite3_changes(db_);
+    sqlite3_finalize(stmt);
+    
+    if (changedRows == 0) {
+        std::cout << "⚠️ Keine Zeilen geändert - Datei noch nicht in Datenbank. Füge hinzu..." << std::endl;
+        return addMedia(meta);
+    }
+    
+    std::cout << "✅ Erfolgreich aktualisiert: " << meta.filepath << std::endl;
+    return true;
 }
 
 bool MediaDatabase::deleteMedia(int64_t id) {

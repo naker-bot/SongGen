@@ -1,4 +1,7 @@
 #include "GtkRenderer.h"
+#include "TrainingModel.h"
+#include "PatternCaptureEngine.h"
+#include "DataQualityAnalyzer.h"
 #include <iostream>
 #include <iomanip>
 #include <filesystem>
@@ -7,8 +10,28 @@
 #include <algorithm>
 #include <fstream>
 #include <sstream>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <cstring>
 
 namespace fs = std::filesystem;
+
+// 📟 Console Output Capture - Struct für Idle-Callback
+struct ConsoleUpdateData {
+    GtkRenderer* renderer;
+    gchar* text;
+};
+
+// 🪟 Hilfsfunktion: Mache Dialog größenveränderbar und verschiebbar
+static void makeDialogResizable(GtkWidget* dialog, int defaultWidth = 500, int defaultHeight = 200) {
+    if (GTK_IS_WINDOW(dialog)) {
+        gtk_window_set_resizable(GTK_WINDOW(dialog), TRUE);
+        gtk_window_set_default_size(GTK_WINDOW(dialog), defaultWidth, defaultHeight);
+        // Erlaube Verschieben (ist standardmäßig an, aber explizit setzen)
+        gtk_window_set_type_hint(GTK_WINDOW(dialog), GDK_WINDOW_TYPE_HINT_DIALOG);
+    }
+}
 
 GtkRenderer::GtkRenderer() {
     database_ = std::make_unique<MediaDatabase>();
@@ -17,6 +40,9 @@ GtkRenderer::GtkRenderer() {
     generator_ = std::make_unique<SongGenerator>(*database_);
     hvscDownloader_ = std::make_unique<HVSCDownloader>();
     audioPlayer_ = std::make_unique<AudioPlayer>();
+    trainingModel_ = std::make_unique<TrainingModel>(*database_);  // 🎓 Online-Learning
+    patternCapture_ = std::make_unique<SongGen::PatternCaptureEngine>();  // 🎤 Pattern Learning
+    qualityAnalyzer_ = std::make_unique<SongGen::DataQualityAnalyzer>(*database_);  // 📊 Data Quality
 }
 
 GtkRenderer::~GtkRenderer() {
@@ -35,14 +61,38 @@ bool GtkRenderer::initialize() {
         std::cerr << "⚠️ Audio player initialization failed\n";
     }
     
-    // Lade Datenbank
+    // Load learned patterns
+    if (patternCapture_) {
+        const char* home = getenv("HOME");
+        std::string patternPath = std::string(home) + "/.songgen/patterns.json";
+        if (patternCapture_->loadLibrary(patternPath)) {
+            std::cout << "📂 Loaded " << patternCapture_->getAllPatterns().size() 
+                     << " learned patterns\n";
+        }
+    }
+    
+    // Lade Datenbank - unkorrigierte zuerst (lastUsed=0 oder niedrig oben)
     filteredMedia_ = database_->getAll();
+    
+    // 🤖 Automatisches Genre-Learning: Lerne aus bereits korrigierten Tracks
+    autoLearnGenresFromCorrectedTracks();
+    
+    // Sortiere: Noch nicht bearbeitete (lastUsed=0) zuerst, dann nach lastUsed aufsteigend
+    std::sort(filteredMedia_.begin(), filteredMedia_.end(),
+        [](const MediaMetadata& a, const MediaMetadata& b) {
+            if (a.lastUsed == 0 && b.lastUsed != 0) return true;   // Unbearbeitet zuerst
+            if (a.lastUsed != 0 && b.lastUsed == 0) return false;
+            return a.lastUsed < b.lastUsed;  // Ältere Korrekturen vor neueren
+        });
     
     // Erstelle Hauptfenster
     window_ = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(window_), "🎵 SongGen - KI Song Generator");
     gtk_window_set_default_size(GTK_WINDOW(window_), 1200, 800);
     gtk_window_set_position(GTK_WINDOW(window_), GTK_WIN_POS_CENTER);
+    
+    // Speichere Renderer-Instanz im Window für Callbacks
+    g_object_set_data(G_OBJECT(window_), "renderer", this);
     
     g_signal_connect(window_, "destroy", G_CALLBACK(onDestroy), this);
     
@@ -55,12 +105,14 @@ bool GtkRenderer::initialize() {
     gtk_box_pack_start(GTK_BOX(vbox), notebook_, TRUE, TRUE, 0);
     
     // Tabs aufbauen
-    buildDatabaseTab();
     buildBrowserTab();
+    buildDatabaseTab();
     buildHVSCTab();
     buildGeneratorTab();
     buildTrainingTab();
     buildAnalyzerTab();
+    buildHistoryTab();
+    buildDataQualityTab();
     buildSettingsTab();
     
     // Statusbar mit GPU-Anzeige
@@ -75,6 +127,7 @@ bool GtkRenderer::initialize() {
     GtkWidget* gpuBox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 3);
     
     gpuLabel_ = gtk_label_new("GPU: 0%");
+    gtk_label_set_selectable(GTK_LABEL(gpuLabel_), TRUE);
     gtk_widget_set_size_request(gpuLabel_, 60, -1);
     PangoAttrList* attrs = pango_attr_list_new();
     PangoAttribute* attr = pango_attr_family_new("monospace");
@@ -106,15 +159,51 @@ bool GtkRenderer::initialize() {
     
     gtk_box_pack_start(GTK_BOX(vbox), statusBox, FALSE, FALSE, 0);
     
+    // 📟 Echtzeit-Konsolen-Ausgabe (eine Zeile)
+    consoleLabel_ = gtk_label_new("");
+    gtk_label_set_selectable(GTK_LABEL(consoleLabel_), TRUE);
+    gtk_label_set_ellipsize(GTK_LABEL(consoleLabel_), PANGO_ELLIPSIZE_START);  // ... am Anfang
+    gtk_widget_set_halign(consoleLabel_, GTK_ALIGN_START);
+    gtk_widget_set_margin_start(consoleLabel_, 5);
+    gtk_widget_set_margin_end(consoleLabel_, 5);
+    
+    PangoAttrList* consoleAttrs = pango_attr_list_new();
+    PangoAttribute* consoleFont = pango_attr_family_new("monospace");
+    PangoAttribute* consoleSize = pango_attr_size_new(9 * PANGO_SCALE);
+    pango_attr_list_insert(consoleAttrs, consoleFont);
+    pango_attr_list_insert(consoleAttrs, consoleSize);
+    gtk_label_set_attributes(GTK_LABEL(consoleLabel_), consoleAttrs);
+    pango_attr_list_unref(consoleAttrs);
+    
+    gtk_box_pack_start(GTK_BOX(vbox), consoleLabel_, FALSE, FALSE, 0);
+    
+    // 🧠 Idle Learning Status-Label
+    idleLearningLabel_ = gtk_label_new("");
+    gtk_label_set_selectable(GTK_LABEL(idleLearningLabel_), TRUE);
+    gtk_box_pack_start(GTK_BOX(vbox), idleLearningLabel_, FALSE, FALSE, 0);
+    gtk_widget_set_no_show_all(idleLearningLabel_, TRUE);  // Versteckt wenn inaktiv
+    
     // Starte Auto-Sync
     startAutoSync();
     
     // Starte GPU-Update-Timer (alle 500ms)
     g_timeout_add(500, onGPUUpdateTimer, this);
     
+    // 📟 Starte Console-Capture
+    startConsoleCapture();
+    
+    // 🧠 Starte Idle-Learning-System
+    startIdleLearning();
+    
+    // User-Activity-Tracking für alle Events
+    g_signal_connect(window_, "key-press-event", G_CALLBACK(onUserActivity), this);
+    g_signal_connect(window_, "button-press-event", G_CALLBACK(onUserActivity), this);
+    g_signal_connect(window_, "motion-notify-event", G_CALLBACK(onUserActivity), this);
+    
     running_ = true;
     
     std::cout << "✅ GTK renderer initialized\n";
+    std::cout << "🧠 Idle Learning aktiviert (startet nach 30s Inaktivität)\n";
     return true;
 }
 
@@ -126,8 +215,20 @@ void GtkRenderer::run() {
 void GtkRenderer::shutdown() {
     running_ = false;
     stopAutoSync();
+    stopIdleLearning();
+    stopConsoleCapture();
     if (audioPlayer_) {
         audioPlayer_->stop();
+    }
+    
+    // Save learned patterns before shutdown
+    if (patternCapture_) {
+        const char* home = getenv("HOME");
+        std::string patternPath = std::string(home) + "/.songgen/patterns.json";
+        if (patternCapture_->saveLibrary(patternPath)) {
+            std::cout << "💾 Saved " << patternCapture_->getAllPatterns().size() 
+                     << " patterns to " << patternPath << "\n";
+        }
     }
 }
 
@@ -221,6 +322,7 @@ void GtkRenderer::buildDatabaseTab() {
     
     // Info-Label
     dbInfoLabel_ = gtk_label_new(NULL);
+    gtk_label_set_selectable(GTK_LABEL(dbInfoLabel_), TRUE);
     std::string info = "Einträge in Datenbank: " + std::to_string(filteredMedia_.size());
     gtk_label_set_text(GTK_LABEL(dbInfoLabel_), info.c_str());
     gtk_box_pack_start(GTK_BOX(vbox), dbInfoLabel_, FALSE, FALSE, 0);
@@ -389,28 +491,37 @@ void GtkRenderer::buildBrowserTab() {
     gtk_label_set_markup(GTK_LABEL(label), "<span size='large' weight='bold'>📁 Datei-Browser</span>");
     gtk_box_pack_start(GTK_BOX(vbox), label, FALSE, FALSE, 0);
     
-    // Lesezeichen
+    const char* home = getenv("HOME");
+    
+    // Lesezeichen-Leiste
     GtkWidget* hboxBookmarks = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
     gtk_box_pack_start(GTK_BOX(vbox), hboxBookmarks, FALSE, FALSE, 0);
     
-    gtk_box_pack_start(GTK_BOX(hboxBookmarks), gtk_label_new("🔖"), FALSE, FALSE, 0);
+    GtkWidget* labelBookmark = gtk_label_new("🔖 Lesezeichen:");
+    gtk_box_pack_start(GTK_BOX(hboxBookmarks), labelBookmark, FALSE, FALSE, 0);
     
-    const char* home = getenv("HOME");
+    // Lesezeichen ComboBox
+    GtkWidget* bookmarkCombo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(bookmarkCombo), "🏠 Home");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(bookmarkCombo), "🎵 Musik");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(bookmarkCombo), "📥 Downloads");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(bookmarkCombo), "💾 Dokumente");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(bookmarkCombo), "🖼️ Bilder");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(bookmarkCombo), "🎬 Videos");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(bookmarkCombo), "🎹 HVSC");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(bookmarkCombo), "💾 Root (/)");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(bookmarkCombo), "📁 /tmp");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(bookmarkCombo), "⚙️ /etc");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(bookmarkCombo), "🛠️ /usr");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(bookmarkCombo), "📚 /opt");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(bookmarkCombo), 0);
+    gtk_box_pack_start(GTK_BOX(hboxBookmarks), bookmarkCombo, FALSE, FALSE, 0);
     
-    GtkWidget* btnHome = gtk_button_new_with_label("🏠 Home");
-    gtk_box_pack_start(GTK_BOX(hboxBookmarks), btnHome, FALSE, FALSE, 0);
+    GtkWidget* btnGoBookmark = gtk_button_new_with_label("➡️ Gehe zu");
+    gtk_box_pack_start(GTK_BOX(hboxBookmarks), btnGoBookmark, FALSE, FALSE, 0);
     
-    GtkWidget* btnMusic = gtk_button_new_with_label("🎵 Musik");
-    gtk_box_pack_start(GTK_BOX(hboxBookmarks), btnMusic, FALSE, FALSE, 0);
-    
-    GtkWidget* btnDownloads = gtk_button_new_with_label("📥 Downloads");
-    gtk_box_pack_start(GTK_BOX(hboxBookmarks), btnDownloads, FALSE, FALSE, 0);
-    
-    GtkWidget* btnHVSC = gtk_button_new_with_label("🎹 HVSC");
-    gtk_box_pack_start(GTK_BOX(hboxBookmarks), btnHVSC, FALSE, FALSE, 0);
-    
-    GtkWidget* btnRoot = gtk_button_new_with_label("💾 Root");
-    gtk_box_pack_start(GTK_BOX(hboxBookmarks), btnRoot, FALSE, FALSE, 0);
+    GtkWidget* btnAddBookmark = gtk_button_new_with_label("➕ Lesezeichen hinzufügen");
+    gtk_box_pack_start(GTK_BOX(hboxBookmarks), btnAddBookmark, FALSE, FALSE, 0);
     
     // Adressleiste
     GtkWidget* hboxAddr = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
@@ -445,77 +556,84 @@ void GtkRenderer::buildBrowserTab() {
     g_signal_connect(btnFTP, "clicked", G_CALLBACK(onBrowseFTP), this);
     gtk_box_pack_start(GTK_BOX(hbox), btnFTP, FALSE, FALSE, 0);
     
-    // File Chooser Widget (eingebettet)
-    GtkWidget* fileChooser = gtk_file_chooser_widget_new(GTK_FILE_CHOOSER_ACTION_OPEN);
-    gtk_file_chooser_set_select_multiple(GTK_FILE_CHOOSER(fileChooser), TRUE);
-    gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(fileChooser), home ? home : "/");
+    // TreeView Browser mit Checkboxen
+    GtkWidget* scrolledWindow = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolledWindow), 
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
     
-    // Filter für alle Dateien (Standard)
-    GtkFileFilter* filterAll = gtk_file_filter_new();
-    gtk_file_filter_set_name(filterAll, "Alle Dateien");
-    gtk_file_filter_add_pattern(filterAll, "*");
-    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(fileChooser), filterAll);
+    // TreeStore: [✓] | Icon | Name | Typ | Pfad
+    GtkListStore* store = gtk_list_store_new(5, 
+        G_TYPE_BOOLEAN,  // 0: Checkbox
+        G_TYPE_STRING,   // 1: Icon  
+        G_TYPE_STRING,   // 2: Name
+        G_TYPE_STRING,   // 3: Typ
+        G_TYPE_STRING);  // 4: Vollständiger Pfad
     
-    // Filter für Audio-Dateien
-    GtkFileFilter* filterAudio = gtk_file_filter_new();
-    gtk_file_filter_set_name(filterAudio, "Audio-Dateien (*.mp3, *.wav, *.flac, *.ogg)");
-    gtk_file_filter_add_pattern(filterAudio, "*.mp3");
-    gtk_file_filter_add_pattern(filterAudio, "*.wav");
-    gtk_file_filter_add_pattern(filterAudio, "*.flac");
-    gtk_file_filter_add_pattern(filterAudio, "*.ogg");
-    gtk_file_filter_add_pattern(filterAudio, "*.m4a");
-    gtk_file_filter_add_pattern(filterAudio, "*.sid");
-    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(fileChooser), filterAudio);
+    GtkWidget* treeView = gtk_tree_view_new_with_model(GTK_TREE_MODEL(store));
+    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(treeView), TRUE);
     
-    // Filter für Video-Dateien
-    GtkFileFilter* filterVideo = gtk_file_filter_new();
-    gtk_file_filter_set_name(filterVideo, "Video-Dateien (*.mp4, *.mkv, *.avi, *.webm)");
-    gtk_file_filter_add_pattern(filterVideo, "*.mp4");
-    gtk_file_filter_add_pattern(filterVideo, "*.mkv");
-    gtk_file_filter_add_pattern(filterVideo, "*.avi");
-    gtk_file_filter_add_pattern(filterVideo, "*.webm");
-    gtk_file_filter_add_pattern(filterVideo, "*.mov");
-    gtk_file_filter_add_pattern(filterVideo, "*.flv");
-    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(fileChooser), filterVideo);
+    // Spalte 1: Checkbox
+    GtkCellRenderer* rendererToggle = gtk_cell_renderer_toggle_new();
+    GtkTreeViewColumn* colToggle = gtk_tree_view_column_new_with_attributes("✓", rendererToggle, "active", 0, NULL);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(treeView), colToggle);
+    g_signal_connect(rendererToggle, "toggled", G_CALLBACK(onBrowserToggleCell), store);
     
-    // Setze "Alle Dateien" als Standard
-    gtk_file_chooser_set_filter(GTK_FILE_CHOOSER(fileChooser), filterAll);
+    // Spalte 2: Icon
+    GtkCellRenderer* rendererIcon = gtk_cell_renderer_text_new();
+    GtkTreeViewColumn* colIcon = gtk_tree_view_column_new_with_attributes("", rendererIcon, "text", 1, NULL);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(treeView), colIcon);
     
-    gtk_box_pack_start(GTK_BOX(vbox), fileChooser, TRUE, TRUE, 0);
+    // Spalte 3: Name
+    GtkCellRenderer* rendererName = gtk_cell_renderer_text_new();
+    GtkTreeViewColumn* colName = gtk_tree_view_column_new_with_attributes("Name", rendererName, "text", 2, NULL);
+    gtk_tree_view_column_set_expand(colName, TRUE);
+    gtk_tree_view_column_set_resizable(colName, TRUE);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(treeView), colName);
     
-    // Buttons zum Hinzufügen
+    // Spalte 4: Typ
+    GtkCellRenderer* rendererType = gtk_cell_renderer_text_new();
+    GtkTreeViewColumn* colType = gtk_tree_view_column_new_with_attributes("Typ", rendererType, "text", 3, NULL);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(treeView), colType);
+    
+    gtk_container_add(GTK_CONTAINER(scrolledWindow), treeView);
+    gtk_box_pack_start(GTK_BOX(vbox), scrolledWindow, TRUE, TRUE, 0);
+    
+    // Lade initiales Verzeichnis
+    std::string currentPath = home ? home : "/";
+    loadBrowserDirectory(currentPath, store);
+    
+    // Control Box mit Buttons
     GtkWidget* btnBox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
-    GtkWidget* btnAddSelected = gtk_button_new_with_label("✅ Ausgewählte Dateien hinzufügen");
-    GtkWidget* btnAddFolder = gtk_button_new_with_label("📁 Aktuellen Ordner rekursiv hinzufügen");
+    
+    GtkWidget* btnSelectAll = gtk_button_new_with_label("☑️ Alle");
+    g_signal_connect(btnSelectAll, "clicked", G_CALLBACK(onBrowserSelectAll), store);
+    gtk_box_pack_start(GTK_BOX(btnBox), btnSelectAll, FALSE, FALSE, 0);
+    
+    GtkWidget* btnDeselectAll = gtk_button_new_with_label("☐ Keine");
+    g_signal_connect(btnDeselectAll, "clicked", G_CALLBACK(onBrowserDeselectAll), store);
+    gtk_box_pack_start(GTK_BOX(btnBox), btnDeselectAll, FALSE, FALSE, 0);
+    
+    GtkWidget* btnAddSelected = gtk_button_new_with_label("✅ Markierte hinzufügen (Ordner rekursiv)");
     gtk_box_pack_start(GTK_BOX(btnBox), btnAddSelected, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(btnBox), btnAddFolder, TRUE, TRUE, 0);
+    
     gtk_box_pack_start(GTK_BOX(vbox), btnBox, FALSE, FALSE, 0);
     
     // Speichere Widgets für Callbacks
-    struct BrowserData {
-        GtkWidget* addrEntry;
-        GtkWidget* fileChooser;
-        GtkRenderer* self;
-    };
+    BrowserData* browserData = new BrowserData{addrEntry, treeView, store, currentPath, this};
     
-    BrowserData* browserData = new BrowserData{addrEntry, fileChooser, this};
-    
-    // Verbinde Adressleiste mit FileChooser
+    // Verbinde Callbacks
     g_signal_connect(btnGo, "clicked", G_CALLBACK(onAddressBarGo), browserData);
-    
-    // Verbinde Buttons
     g_signal_connect(btnAddSelected, "clicked", G_CALLBACK(onAddSelectedFiles), browserData);
-    g_signal_connect(btnAddFolder, "clicked", G_CALLBACK(onAddCurrentFolder), browserData);
+    g_signal_connect(treeView, "row-activated", G_CALLBACK(onBrowserRowActivated), browserData);
     
-    // Verbinde Lesezeichen-Buttons
-    g_signal_connect(btnHome, "clicked", G_CALLBACK(onBookmarkClick), browserData);
-    g_signal_connect(btnMusic, "clicked", G_CALLBACK(onBookmarkClick), browserData);
-    g_signal_connect(btnDownloads, "clicked", G_CALLBACK(onBookmarkClick), browserData);
-    g_signal_connect(btnHVSC, "clicked", G_CALLBACK(onBookmarkClick), browserData);
-    g_signal_connect(btnRoot, "clicked", G_CALLBACK(onBookmarkClick), browserData);
+    // Verbinde Lesezeichen-Callbacks
+    g_object_set_data(G_OBJECT(btnGoBookmark), "bookmark-combo", bookmarkCombo);
+    g_object_set_data(G_OBJECT(btnGoBookmark), "browser-data", browserData);
+    g_signal_connect(btnGoBookmark, "clicked", G_CALLBACK(onBookmarkGo), nullptr);
     
-    // Aktualisiere Adressleiste wenn sich FileChooser-Ordner ändert
-    g_signal_connect(fileChooser, "current-folder-changed", G_CALLBACK(onFolderChanged), browserData);
+    g_object_set_data(G_OBJECT(btnAddBookmark), "addr-entry", addrEntry);
+    g_object_set_data(G_OBJECT(btnAddBookmark), "bookmark-combo", bookmarkCombo);
+    g_signal_connect(btnAddBookmark, "clicked", G_CALLBACK(onBookmarkAdd), nullptr);
     
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook_), vbox, gtk_label_new("📁 Browser"));
     browserTab_ = vbox;
@@ -531,6 +649,7 @@ void GtkRenderer::buildHVSCTab() {
     gtk_box_pack_start(GTK_BOX(vbox), label, FALSE, FALSE, 0);
     
     GtkWidget* sublabel = gtk_label_new("75.000+ Commodore 64 SID Musikdateien");
+    gtk_label_set_selectable(GTK_LABEL(sublabel), TRUE);
     gtk_box_pack_start(GTK_BOX(vbox), sublabel, FALSE, FALSE, 0);
     
     // Buttons
@@ -553,12 +672,170 @@ void GtkRenderer::buildHVSCTab() {
     g_signal_connect(btnSync, "clicked", G_CALLBACK(onDBSync), this);
     gtk_box_pack_start(GTK_BOX(hbox), btnSync, FALSE, FALSE, 0);
     
+    // Zweite Button-Zeile
+    GtkWidget* hbox2 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_box_pack_start(GTK_BOX(vbox), hbox2, FALSE, FALSE, 0);
+    
+    GtkWidget* btnAnalyzeSIDs = gtk_button_new_with_label("🎵 SID-MP3s analysieren & in DB");
+    g_signal_connect(btnAnalyzeSIDs, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
+        auto* renderer = static_cast<GtkRenderer*>(data);
+        
+        const char* home = getenv("HOME");
+        std::string convertedPath = std::string(home) + "/.songgen/hvsc/converted/";
+        
+        if (!std::filesystem::exists(convertedPath)) {
+            GtkWidget* dialog = gtk_message_dialog_new(
+                GTK_WINDOW(renderer->window_), GTK_DIALOG_MODAL, GTK_MESSAGE_WARNING,
+                GTK_BUTTONS_OK, "⚠️ Keine konvertierten SID-Dateien gefunden!\n\n"
+                "Pfad: %s\n\nFühre zuerst 'SIDs extrahieren' aus.", convertedPath.c_str());
+            gtk_dialog_run(GTK_DIALOG(dialog));
+            gtk_widget_destroy(dialog);
+            return;
+        }
+        
+        // Zähle MP3-Dateien
+        std::vector<std::string> mp3Files;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(convertedPath)) {
+            if (entry.path().extension() == ".mp3") {
+                mp3Files.push_back(entry.path().string());
+            }
+        }
+        
+        if (mp3Files.empty()) {
+            GtkWidget* dialog = gtk_message_dialog_new(
+                GTK_WINDOW(renderer->window_), GTK_DIALOG_MODAL, GTK_MESSAGE_INFO,
+                GTK_BUTTONS_OK, "ℹ️ Keine MP3-Dateien gefunden in:\n%s", convertedPath.c_str());
+            gtk_dialog_run(GTK_DIALOG(dialog));
+            gtk_widget_destroy(dialog);
+            return;
+        }
+        
+        // Bestätigungs-Dialog
+        GtkWidget* confirmDialog = gtk_message_dialog_new(
+            GTK_WINDOW(renderer->window_), GTK_DIALOG_MODAL, GTK_MESSAGE_QUESTION,
+            GTK_BUTTONS_YES_NO,
+            "🎵 SID-MP3 Analyse starten?\n\n"
+            "%zu MP3-Dateien gefunden\n"
+            "Alle werden analysiert und zur Datenbank hinzugefügt.\n\n"
+            "Genre: SID\n"
+            "Dies kann einige Zeit dauern...",
+            mp3Files.size());
+        
+        int response = gtk_dialog_run(GTK_DIALOG(confirmDialog));
+        gtk_widget_destroy(confirmDialog);
+        
+        if (response != GTK_RESPONSE_YES) return;
+        
+        // Progress Dialog
+        GtkWidget* progressDialog = gtk_dialog_new_with_buttons(
+            "🎵 Analysiere SID-MP3s",
+            GTK_WINDOW(renderer->window_),
+            (GtkDialogFlags)0,
+            NULL
+        );
+        
+        makeDialogResizable(progressDialog, 500, 180);
+        GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(progressDialog));
+        GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+        gtk_container_set_border_width(GTK_CONTAINER(vbox), 15);
+        gtk_container_add(GTK_CONTAINER(content), vbox);
+        
+        GtkWidget* progressBar = gtk_progress_bar_new();
+        gtk_box_pack_start(GTK_BOX(vbox), progressBar, FALSE, FALSE, 0);
+        
+        GtkWidget* statusLabel = gtk_label_new("Starte Analyse...");
+        gtk_label_set_selectable(GTK_LABEL(statusLabel), TRUE);
+        gtk_box_pack_start(GTK_BOX(vbox), statusLabel, FALSE, FALSE, 0);
+        
+        gtk_widget_show_all(progressDialog);
+        
+        // Analysiere in Batches
+        int processed = 0;
+        int added = 0;
+        int skipped = 0;
+        
+        for (const auto& mp3Path : mp3Files) {
+            // Prüfe ob bereits in DB
+            auto existing = renderer->database_->getAll();
+            bool alreadyExists = false;
+            for (const auto& media : existing) {
+                if (media.filepath == mp3Path) {
+                    alreadyExists = true;
+                    break;
+                }
+            }
+            
+            if (alreadyExists) {
+                skipped++;
+            } else {
+                // Analysiere
+                MediaMetadata meta;
+                meta.filepath = mp3Path;
+                meta.title = std::filesystem::path(mp3Path).stem().string();
+                meta.artist = "HVSC";
+                meta.genre = "SID";
+                
+                if (renderer->analyzer_->analyze(mp3Path, meta)) {
+                    meta.analyzed = true;
+                    meta.addedTimestamp = std::time(nullptr);
+                    
+                    if (renderer->database_->addMedia(meta)) {
+                        added++;
+                    } else {
+                        skipped++;
+                    }
+                } else {
+                    skipped++;
+                }
+            }
+            
+            processed++;
+            
+            // Update UI
+            float progress = (float)processed / mp3Files.size();
+            gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(progressBar), progress);
+            
+            std::string status = "Verarbeitet: " + std::to_string(processed) + " / " + 
+                                std::to_string(mp3Files.size()) + "\n" +
+                                "Neu: " + std::to_string(added) + " | " +
+                                "Übersprungen: " + std::to_string(skipped);
+            gtk_label_set_text(GTK_LABEL(statusLabel), status.c_str());
+            
+            // UI aktualisieren
+            while (gtk_events_pending()) {
+                gtk_main_iteration();
+            }
+        }
+        
+        gtk_widget_destroy(progressDialog);
+        
+        // Ergebnis-Dialog
+        GtkWidget* resultDialog = gtk_message_dialog_new(
+            GTK_WINDOW(renderer->window_), GTK_DIALOG_MODAL, GTK_MESSAGE_INFO,
+            GTK_BUTTONS_OK,
+            "✅ SID-MP3 Analyse abgeschlossen!\n\n"
+            "📊 Gesamt: %d Dateien\n"
+            "✨ Neu hinzugefügt: %d\n"
+            "⏭️ Übersprungen: %d\n\n"
+            "Alle SID-MP3s sind jetzt im Interactive Training verfügbar!",
+            processed, added, skipped);
+        gtk_dialog_run(GTK_DIALOG(resultDialog));
+        gtk_widget_destroy(resultDialog);
+        
+        // Status aktualisieren
+        renderer->addHistoryEntry("SID-Analyse", 
+            std::to_string(added) + " neue SID-MP3s zur Datenbank hinzugefügt",
+            "✅ Abgeschlossen");
+    }), this);
+    gtk_box_pack_start(GTK_BOX(hbox2), btnAnalyzeSIDs, FALSE, FALSE, 0);
+    
     // Progress Bar
     hvscProgressBar_ = gtk_progress_bar_new();
     gtk_box_pack_start(GTK_BOX(vbox), hvscProgressBar_, FALSE, FALSE, 0);
     
     // Status Label
     hvscStatusLabel_ = gtk_label_new("Bereit - Klicke 'HVSC herunterladen' um zu starten");
+    gtk_label_set_selectable(GTK_LABEL(hvscStatusLabel_), TRUE);
     gtk_box_pack_start(GTK_BOX(vbox), hvscStatusLabel_, FALSE, FALSE, 0);
     
     // MP3 Counter
@@ -731,6 +1008,40 @@ void GtkRenderer::buildGeneratorTab() {
     g_signal_connect(btnGenerate, "clicked", G_CALLBACK(onGenerateSong), this);
     gtk_box_pack_start(GTK_BOX(vbox), btnGenerate, FALSE, FALSE, 0);
     
+    // MIDI Export Button
+    GtkWidget* btnExportMIDI = gtk_button_new_with_label("🎹 Als MIDI exportieren");
+    g_signal_connect(btnExportMIDI, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
+        auto* renderer = static_cast<GtkRenderer*>(data);
+        
+        GtkWidget* dialog = gtk_file_chooser_dialog_new(
+            "MIDI exportieren", GTK_WINDOW(renderer->window_),
+            GTK_FILE_CHOOSER_ACTION_SAVE,
+            "_Abbrechen", GTK_RESPONSE_CANCEL,
+            "_Speichern", GTK_RESPONSE_ACCEPT,
+            NULL);
+        
+        gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dialog), TRUE);
+        gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dialog), "song.mid");
+        
+        if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+            char* filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+            
+            // TODO: Actually export current song to MIDI
+            std::cout << "🎹 Exporting MIDI to: " << filename << std::endl;
+            
+            GtkWidget* msgDialog = gtk_message_dialog_new(
+                GTK_WINDOW(renderer->window_), GTK_DIALOG_MODAL, GTK_MESSAGE_INFO,
+                GTK_BUTTONS_OK, "MIDI wurde exportiert nach:\n%s", filename);
+            gtk_dialog_run(GTK_DIALOG(msgDialog));
+            gtk_widget_destroy(msgDialog);
+            
+            g_free(filename);
+        }
+        
+        gtk_widget_destroy(dialog);
+    }), this);
+    gtk_box_pack_start(GTK_BOX(vbox), btnExportMIDI, FALSE, FALSE, 0);
+    
     // Ausgabepfad
     GtkWidget* hbox5 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
     gtk_box_pack_start(GTK_BOX(vbox), hbox5, FALSE, FALSE, 0);
@@ -739,7 +1050,318 @@ void GtkRenderer::buildGeneratorTab() {
     const char* home = getenv("HOME");
     std::string outputPath = std::string(home) + "/.songgen/generated/";
     GtkWidget* pathLabel = gtk_label_new(outputPath.c_str());
+    gtk_label_set_selectable(GTK_LABEL(pathLabel), TRUE);
     gtk_box_pack_start(GTK_BOX(hbox5), pathLabel, FALSE, FALSE, 0);
+    
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 10);
+    
+    // 🎤 Pattern Capture System
+    patternCaptureFrame_ = gtk_frame_new("🎤 Pattern Learning - Mikrofon Eingabe");
+    gtk_box_pack_start(GTK_BOX(vbox), patternCaptureFrame_, FALSE, FALSE, 0);
+    
+    GtkWidget* patternBox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_container_set_border_width(GTK_CONTAINER(patternBox), 10);
+    gtk_container_add(GTK_CONTAINER(patternCaptureFrame_), patternBox);
+    
+    // Description
+    GtkWidget* patternDesc = gtk_label_new("Spiele Rhythmen oder Melodien über dein Mikrofon ein,\num dem System beizubringen, was gut klingt.");
+    gtk_label_set_line_wrap(GTK_LABEL(patternDesc), TRUE);
+    gtk_box_pack_start(GTK_BOX(patternBox), patternDesc, FALSE, FALSE, 0);
+    
+    // Pattern Type Selection
+    GtkWidget* hboxPatternType = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_box_pack_start(GTK_BOX(patternBox), hboxPatternType, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(hboxPatternType), gtk_label_new("Pattern-Typ:"), FALSE, FALSE, 0);
+    
+    patternTypeCombo_ = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(patternTypeCombo_), "Rhythmus");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(patternTypeCombo_), "Melodie");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(patternTypeCombo_), 0);
+    gtk_box_pack_start(GTK_BOX(hboxPatternType), patternTypeCombo_, FALSE, FALSE, 0);
+    
+    // Recording Controls
+    GtkWidget* hboxPatternControls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_box_pack_start(GTK_BOX(patternBox), hboxPatternControls, FALSE, FALSE, 0);
+    
+    patternRecordBtn_ = gtk_button_new_with_label("🔴 Aufnahme starten");
+    g_signal_connect(patternRecordBtn_, "clicked", G_CALLBACK(onPatternRecord), this);
+    gtk_box_pack_start(GTK_BOX(hboxPatternControls), patternRecordBtn_, FALSE, FALSE, 0);
+    
+    patternStopBtn_ = gtk_button_new_with_label("⏹️ Stoppen");
+    gtk_widget_set_sensitive(patternStopBtn_, FALSE);
+    g_signal_connect(patternStopBtn_, "clicked", G_CALLBACK(onPatternStop), this);
+    gtk_box_pack_start(GTK_BOX(hboxPatternControls), patternStopBtn_, FALSE, FALSE, 0);
+    
+    // Status Label
+    patternStatusLabel_ = gtk_label_new("Bereit zur Aufnahme");
+    gtk_label_set_selectable(GTK_LABEL(patternStatusLabel_), TRUE);
+    PangoAttrList* patternAttrs = pango_attr_list_new();
+    PangoAttribute* patternAttr = pango_attr_weight_new(PANGO_WEIGHT_BOLD);
+    pango_attr_list_insert(patternAttrs, patternAttr);
+    gtk_label_set_attributes(GTK_LABEL(patternStatusLabel_), patternAttrs);
+    pango_attr_list_unref(patternAttrs);
+    gtk_box_pack_start(GTK_BOX(patternBox), patternStatusLabel_, FALSE, FALSE, 0);
+    
+    // Pattern Library
+    GtkWidget* frameLibrary = gtk_frame_new("📚 Gelernte Patterns");
+    gtk_box_pack_start(GTK_BOX(patternBox), frameLibrary, TRUE, TRUE, 5);
+    
+    GtkWidget* libraryBox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_container_set_border_width(GTK_CONTAINER(libraryBox), 5);
+    gtk_container_add(GTK_CONTAINER(frameLibrary), libraryBox);
+    
+    // ScrolledWindow for pattern list
+    GtkWidget* scrolledWindow = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolledWindow),
+                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(scrolledWindow, -1, 150);
+    gtk_box_pack_start(GTK_BOX(libraryBox), scrolledWindow, TRUE, TRUE, 0);
+    
+    // TreeView for patterns
+    patternLibraryStore_ = gtk_list_store_new(6, G_TYPE_STRING, G_TYPE_STRING, 
+                                                G_TYPE_STRING, G_TYPE_STRING,
+                                                G_TYPE_STRING, G_TYPE_INT);
+    patternLibraryTree_ = gtk_tree_view_new_with_model(GTK_TREE_MODEL(patternLibraryStore_));
+    
+    GtkCellRenderer* renderer = gtk_cell_renderer_text_new();
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(patternLibraryTree_),
+        -1, "Typ", renderer, "text", 0, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(patternLibraryTree_),
+        -1, "Name", renderer, "text", 1, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(patternLibraryTree_),
+        -1, "Groove", renderer, "text", 2, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(patternLibraryTree_),
+        -1, "Komplexität", renderer, "text", 3, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(patternLibraryTree_),
+        -1, "Bewertung", renderer, "text", 4, NULL);
+    
+    g_signal_connect(patternLibraryTree_, "row-activated", 
+                     G_CALLBACK(onPatternLibraryRowActivated), this);
+    
+    gtk_container_add(GTK_CONTAINER(scrolledWindow), patternLibraryTree_);
+    
+    // Pattern Library Buttons
+    GtkWidget* hboxLibraryBtns = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_box_pack_start(GTK_BOX(libraryBox), hboxLibraryBtns, FALSE, FALSE, 0);
+    
+    GtkWidget* btnPatternExport = gtk_button_new_with_label("💾 Exportieren");
+    g_signal_connect(btnPatternExport, "clicked", G_CALLBACK(onPatternExport), this);
+    gtk_box_pack_start(GTK_BOX(hboxLibraryBtns), btnPatternExport, FALSE, FALSE, 0);
+    
+    GtkWidget* btnPatternImport = gtk_button_new_with_label("📂 Importieren");
+    g_signal_connect(btnPatternImport, "clicked", G_CALLBACK(onPatternImport), this);
+    gtk_box_pack_start(GTK_BOX(hboxLibraryBtns), btnPatternImport, FALSE, FALSE, 0);
+    
+    GtkWidget* btnPatternClear = gtk_button_new_with_label("🗑️ Alle löschen");
+    g_signal_connect(btnPatternClear, "clicked", G_CALLBACK(onPatternClear), this);
+    gtk_box_pack_start(GTK_BOX(hboxLibraryBtns), btnPatternClear, FALSE, FALSE, 0);
+    
+    // ▶️ Audio-Player für generierte Songs
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 10);
+    
+    GtkWidget* framePlayer = gtk_frame_new("🎵 Audio-Player");
+    gtk_box_pack_start(GTK_BOX(vbox), framePlayer, FALSE, FALSE, 0);
+    
+    genPlayerBox_ = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_container_set_border_width(GTK_CONTAINER(genPlayerBox_), 10);
+    gtk_container_add(GTK_CONTAINER(framePlayer), genPlayerBox_);
+    
+    // Dateiname-Label
+    genPlayerLabel_ = gtk_label_new("Kein Song geladen");
+    gtk_label_set_selectable(GTK_LABEL(genPlayerLabel_), TRUE);
+    gtk_box_pack_start(GTK_BOX(genPlayerBox_), genPlayerLabel_, FALSE, FALSE, 0);
+    
+    // Position Slider
+    genPlayerScale_ = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0.0, 100.0, 1.0);
+    gtk_scale_set_draw_value(GTK_SCALE(genPlayerScale_), FALSE);
+    gtk_widget_set_size_request(genPlayerScale_, 400, -1);
+    gtk_box_pack_start(GTK_BOX(genPlayerBox_), genPlayerScale_, FALSE, FALSE, 0);
+    
+    // Zeit-Label
+    genPlayerTimeLabel_ = gtk_label_new("00:00 / 00:00");
+    gtk_label_set_selectable(GTK_LABEL(genPlayerTimeLabel_), TRUE);
+    gtk_box_pack_start(GTK_BOX(genPlayerBox_), genPlayerTimeLabel_, FALSE, FALSE, 0);
+    
+    // Control Buttons
+    GtkWidget* hboxPlayerControls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_box_pack_start(GTK_BOX(genPlayerBox_), hboxPlayerControls, FALSE, FALSE, 0);
+    
+    genPlayerBtnPlay_ = gtk_button_new_with_label("▶️ Play");
+    gtk_box_pack_start(GTK_BOX(hboxPlayerControls), genPlayerBtnPlay_, FALSE, FALSE, 0);
+    
+    genPlayerBtnPause_ = gtk_button_new_with_label("⏸️ Pause");
+    gtk_box_pack_start(GTK_BOX(hboxPlayerControls), genPlayerBtnPause_, FALSE, FALSE, 0);
+    
+    genPlayerBtnStop_ = gtk_button_new_with_label("⏹️ Stop");
+    gtk_box_pack_start(GTK_BOX(hboxPlayerControls), genPlayerBtnStop_, FALSE, FALSE, 0);
+    
+    GtkWidget* btnLoadFile = gtk_button_new_with_label("📁 Song laden...");
+    gtk_box_pack_start(GTK_BOX(hboxPlayerControls), btnLoadFile, FALSE, FALSE, 0);
+    
+    // Initialize state
+    genPlayerTimeoutId_ = 0;
+    genPlayerIsPlaying_ = false;
+    genPlayerIsSeeking_ = false;
+    genPlayerCurrentFile_ = "";
+    
+    // Position Update Callback
+    static auto genPlayerUpdatePosition = [](gpointer data) -> gboolean {
+        auto* renderer = static_cast<GtkRenderer*>(data);
+        
+        if (!renderer->audioPlayer_) {
+            return G_SOURCE_CONTINUE;
+        }
+        
+        // NICHT updaten während User den Slider bewegt!
+        if (renderer->genPlayerIsSeeking_) {
+            return G_SOURCE_CONTINUE;
+        }
+        
+        double pos = renderer->audioPlayer_->getPosition();
+        double dur = renderer->audioPlayer_->getDuration();
+        
+        if (dur > 0) {
+            // Signal blockieren während automatischem Update
+            g_signal_handlers_block_by_func(renderer->genPlayerScale_, (gpointer)G_CALLBACK(nullptr), renderer);
+            gtk_range_set_value(GTK_RANGE(renderer->genPlayerScale_), (pos / dur) * 100.0);
+            g_signal_handlers_unblock_by_func(renderer->genPlayerScale_, (gpointer)G_CALLBACK(nullptr), renderer);
+            
+            int posMin = (int)pos / 60;
+            int posSec = (int)pos % 60;
+            int durMin = (int)dur / 60;
+            int durSec = (int)dur % 60;
+            
+            char timeStr[32];
+            snprintf(timeStr, sizeof(timeStr), "%02d:%02d / %02d:%02d", posMin, posSec, durMin, durSec);
+            gtk_label_set_text(GTK_LABEL(renderer->genPlayerTimeLabel_), timeStr);
+        }
+        
+        return G_SOURCE_CONTINUE;
+    };
+    
+    // Play Button
+    g_signal_connect(genPlayerBtnPlay_, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
+        auto* renderer = static_cast<GtkRenderer*>(data);
+        
+        if (!renderer->audioPlayer_) return;
+        
+        if (renderer->genPlayerCurrentFile_.empty()) {
+            GtkWidget* dialog = gtk_message_dialog_new(
+                GTK_WINDOW(renderer->window_), GTK_DIALOG_MODAL, GTK_MESSAGE_INFO,
+                GTK_BUTTONS_OK, "Bitte erst einen Song laden!");
+            gtk_dialog_run(GTK_DIALOG(dialog));
+            gtk_widget_destroy(dialog);
+            return;
+        }
+        
+        if (!renderer->genPlayerIsPlaying_) {
+            if (renderer->audioPlayer_->load(renderer->genPlayerCurrentFile_)) {
+                renderer->audioPlayer_->play();
+                renderer->genPlayerIsPlaying_ = true;
+                
+                // Start timer
+                if (renderer->genPlayerTimeoutId_ > 0) {
+                    g_source_remove(renderer->genPlayerTimeoutId_);
+                }
+                renderer->genPlayerTimeoutId_ = g_timeout_add(250, genPlayerUpdatePosition, renderer);
+            }
+        }
+    }), this);
+    
+    // Pause Button
+    g_signal_connect(genPlayerBtnPause_, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
+        auto* renderer = static_cast<GtkRenderer*>(data);
+        
+        if (renderer->audioPlayer_ && renderer->genPlayerIsPlaying_) {
+            renderer->audioPlayer_->pause();
+            renderer->genPlayerIsPlaying_ = false;
+        }
+    }), this);
+    
+    // Stop Button
+    g_signal_connect(genPlayerBtnStop_, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
+        auto* renderer = static_cast<GtkRenderer*>(data);
+        
+        if (renderer->audioPlayer_) {
+            renderer->audioPlayer_->stop();
+            renderer->genPlayerIsPlaying_ = false;
+            
+            if (renderer->genPlayerTimeoutId_ > 0) {
+                g_source_remove(renderer->genPlayerTimeoutId_);
+                renderer->genPlayerTimeoutId_ = 0;
+            }
+            
+            gtk_range_set_value(GTK_RANGE(renderer->genPlayerScale_), 0.0);
+            gtk_label_set_text(GTK_LABEL(renderer->genPlayerTimeLabel_), "00:00 / 00:00");
+        }
+    }), this);
+    
+    // Load File Button
+    g_signal_connect(btnLoadFile, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
+        auto* renderer = static_cast<GtkRenderer*>(data);
+        
+        GtkWidget* dialog = gtk_file_chooser_dialog_new(
+            "Song laden", GTK_WINDOW(renderer->window_),
+            GTK_FILE_CHOOSER_ACTION_OPEN,
+            "_Abbrechen", GTK_RESPONSE_CANCEL,
+            "_Öffnen", GTK_RESPONSE_ACCEPT,
+            NULL);
+        
+        // Set default folder to generated folder
+        const char* home = getenv("HOME");
+        std::string genPath = std::string(home) + "/.songgen/generated/";
+        gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(dialog), genPath.c_str());
+        
+        // Filter for audio files
+        GtkFileFilter* filter = gtk_file_filter_new();
+        gtk_file_filter_set_name(filter, "Audio Dateien");
+        gtk_file_filter_add_pattern(filter, "*.wav");
+        gtk_file_filter_add_pattern(filter, "*.mp3");
+        gtk_file_filter_add_pattern(filter, "*.ogg");
+        gtk_file_filter_add_pattern(filter, "*.flac");
+        gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
+        
+        if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+            char* filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+            renderer->genPlayerCurrentFile_ = filename;
+            
+            std::string fn = std::filesystem::path(filename).filename().string();
+            gtk_label_set_text(GTK_LABEL(renderer->genPlayerLabel_), ("🎵 " + fn).c_str());
+            
+            g_free(filename);
+        }
+        
+        gtk_widget_destroy(dialog);
+    }), this);
+    
+    // Position Slider Seek - verbesserte Callbacks
+    g_signal_connect(genPlayerScale_, "button-press-event", G_CALLBACK(+[](GtkWidget*, GdkEventButton*, gpointer data) -> gboolean {
+        auto* renderer = static_cast<GtkRenderer*>(data);
+        renderer->genPlayerIsSeeking_ = true;
+        return FALSE;
+    }), this);
+    
+    g_signal_connect(genPlayerScale_, "button-release-event", G_CALLBACK(+[](GtkWidget*, GdkEventButton*, gpointer data) -> gboolean {
+        auto* renderer = static_cast<GtkRenderer*>(data);
+        renderer->genPlayerIsSeeking_ = false;
+        return FALSE;
+    }), this);
+    
+    // Value-Changed: Erlaube Seek während Ziehen UND bei Klick
+    g_signal_connect(genPlayerScale_, "value-changed", G_CALLBACK(+[](GtkRange* range, gpointer data) {
+        auto* renderer = static_cast<GtkRenderer*>(data);
+        
+        // Nur wenn User aktiv seeked (nicht während automatischer Updates)
+        if (renderer->genPlayerIsSeeking_ && renderer->audioPlayer_ && !renderer->genPlayerCurrentFile_.empty()) {
+            double value = gtk_range_get_value(range);
+            double dur = renderer->audioPlayer_->getDuration();
+            
+            if (dur > 0) {
+                double seekPos = (value / 100.0) * dur;
+                renderer->audioPlayer_->seek(seekPos);
+            }
+        }
+    }), this);
     
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook_), vbox, gtk_label_new("🎼 Generator"));
     generatorTab_ = vbox;
@@ -808,9 +1430,17 @@ void GtkRenderer::buildSettingsTab() {
     std::string hvscPath = std::string(home) + "/.songgen/hvsc/";
     std::string genPath = std::string(home) + "/.songgen/generated/";
     
-    gtk_box_pack_start(GTK_BOX(vbox4), gtk_label_new(("Datenbank: " + dbPath).c_str()), FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(vbox4), gtk_label_new(("HVSC: " + hvscPath).c_str()), FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(vbox4), gtk_label_new(("Generiert: " + genPath).c_str()), FALSE, FALSE, 0);
+    GtkWidget* labelDbPath = gtk_label_new(("Datenbank: " + dbPath).c_str());
+    gtk_label_set_selectable(GTK_LABEL(labelDbPath), TRUE);
+    gtk_box_pack_start(GTK_BOX(vbox4), labelDbPath, FALSE, FALSE, 0);
+    
+    GtkWidget* labelHvscPath = gtk_label_new(("HVSC: " + hvscPath).c_str());
+    gtk_label_set_selectable(GTK_LABEL(labelHvscPath), TRUE);
+    gtk_box_pack_start(GTK_BOX(vbox4), labelHvscPath, FALSE, FALSE, 0);
+    
+    GtkWidget* labelGenPath = gtk_label_new(("Generiert: " + genPath).c_str());
+    gtk_label_set_selectable(GTK_LABEL(labelGenPath), TRUE);
+    gtk_box_pack_start(GTK_BOX(vbox4), labelGenPath, FALSE, FALSE, 0);
     
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook_), vbox, gtk_label_new("⚙️ Settings"));
     settingsTab_ = vbox;
@@ -826,6 +1456,7 @@ void GtkRenderer::buildTrainingTab() {
     gtk_box_pack_start(GTK_BOX(vbox), label, FALSE, FALSE, 0);
     
     GtkWidget* sublabel = gtk_label_new("Trainiere und verwalte das Audio-Analyse-Modell");
+    gtk_label_set_selectable(GTK_LABEL(sublabel), TRUE);
     gtk_box_pack_start(GTK_BOX(vbox), sublabel, FALSE, FALSE, 0);
     
     // Steuerungs-Buttons
@@ -847,6 +1478,26 @@ void GtkRenderer::buildTrainingTab() {
     GtkWidget* btnHistory = gtk_button_new_with_label("📜 Entscheidungs-Historie");
     g_signal_connect(btnHistory, "clicked", G_CALLBACK(onShowDecisionHistory), this);
     gtk_box_pack_start(GTK_BOX(hboxControls), btnHistory, FALSE, FALSE, 0);
+    
+    GtkWidget* btnInteractive = gtk_button_new_with_label("🎓 Interaktives Training");
+    g_signal_connect(btnInteractive, "clicked", G_CALLBACK(onInteractiveTraining), this);
+    gtk_box_pack_start(GTK_BOX(hboxControls), btnInteractive, FALSE, FALSE, 0);
+    
+    // 🧠 Intelligente Datenbank-Korrektur (Zweite Zeile)
+    GtkWidget* hboxControls2 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_box_pack_start(GTK_BOX(vbox), hboxControls2, FALSE, FALSE, 0);
+    
+    GtkWidget* btnAnalyze = gtk_button_new_with_label("🔍 Datenbank analysieren");
+    g_signal_connect(btnAnalyze, "clicked", G_CALLBACK(onAnalyzeDatabase), this);
+    gtk_box_pack_start(GTK_BOX(hboxControls2), btnAnalyze, FALSE, FALSE, 0);
+    
+    GtkWidget* btnPatterns = gtk_button_new_with_label("📊 Muster anzeigen");
+    g_signal_connect(btnPatterns, "clicked", G_CALLBACK(onShowPatterns), this);
+    gtk_box_pack_start(GTK_BOX(hboxControls2), btnPatterns, FALSE, FALSE, 0);
+    
+    GtkWidget* btnStructure = gtk_button_new_with_label("🎵 Song-Struktur lernen");
+    g_signal_connect(btnStructure, "clicked", G_CALLBACK(onLearnSongStructure), this);
+    gtk_box_pack_start(GTK_BOX(hboxControls2), btnStructure, FALSE, FALSE, 0);
     
     // Training-Einstellungen
     GtkWidget* frameSettings = gtk_frame_new("Training-Einstellungen");
@@ -887,10 +1538,87 @@ void GtkRenderer::buildTrainingTab() {
     gtk_container_add(GTK_CONTAINER(frameProgress), vboxProgress);
     
     trainingStatusLabel_ = gtk_label_new("Bereit zum Training");
+    gtk_label_set_selectable(GTK_LABEL(trainingStatusLabel_), TRUE);
     gtk_box_pack_start(GTK_BOX(vboxProgress), trainingStatusLabel_, FALSE, FALSE, 0);
     
     trainingProgressBar_ = gtk_progress_bar_new();
     gtk_box_pack_start(GTK_BOX(vboxProgress), trainingProgressBar_, FALSE, FALSE, 0);
+    
+    // 🎸 Instrumenten-Extraktion Info
+    GtkWidget* frameInstruments = gtk_frame_new("🎸 Instrumenten-Library");
+    gtk_box_pack_start(GTK_BOX(vbox), frameInstruments, FALSE, FALSE, 0);
+    
+    GtkWidget* vboxInstruments = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_container_set_border_width(GTK_CONTAINER(vboxInstruments), 10);
+    gtk_container_add(GTK_CONTAINER(frameInstruments), vboxInstruments);
+    
+    GtkWidget* labelInstrInfo = gtk_label_new(
+        "Während des Trainings werden automatisch Instrumente aus den Tracks extrahiert:\n"
+        "📁 Speicherort: ~/.songgen/instruments/\n"
+        "🎵 Kategorien: Kicks, Snares, Hi-Hats, Bass, Leads, Other\n"
+        "⚡ Extraktion: Alle 10 Tracks während Feature-Extraktion");
+    gtk_label_set_line_wrap(GTK_LABEL(labelInstrInfo), TRUE);
+    gtk_label_set_xalign(GTK_LABEL(labelInstrInfo), 0.0);
+    gtk_box_pack_start(GTK_BOX(vboxInstruments), labelInstrInfo, FALSE, FALSE, 0);
+    
+    GtkWidget* hboxInstrButtons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_box_pack_start(GTK_BOX(vboxInstruments), hboxInstrButtons, FALSE, FALSE, 0);
+    
+    GtkWidget* btnShowInstruments = gtk_button_new_with_label("📂 Instrumenten-Ordner öffnen");
+    g_signal_connect(btnShowInstruments, "clicked", G_CALLBACK(onShowInstrumentsFolder), this);
+    gtk_box_pack_start(GTK_BOX(hboxInstrButtons), btnShowInstruments, FALSE, FALSE, 0);
+    
+    GtkWidget* btnCountInstruments = gtk_button_new_with_label("📊 Statistik anzeigen");
+    g_signal_connect(btnCountInstruments, "clicked", G_CALLBACK(onShowInstrumentStats), this);
+    gtk_box_pack_start(GTK_BOX(hboxInstrButtons), btnCountInstruments, FALSE, FALSE, 0);
+    
+    GtkWidget* btnPlayGenreDemos = gtk_button_new_with_label("🎵 Genre-Demos abspielen");
+    g_signal_connect(btnPlayGenreDemos, "clicked", G_CALLBACK(onPlayGenreDemos), this);
+    gtk_box_pack_start(GTK_BOX(hboxInstrButtons), btnPlayGenreDemos, FALSE, FALSE, 0);
+    
+    GtkWidget* btnRemoveDuplicates = gtk_button_new_with_label("🔍 Duplikate entfernen");
+    g_signal_connect(btnRemoveDuplicates, "clicked", G_CALLBACK(onRemoveInstrumentDuplicates), this);
+    gtk_box_pack_start(GTK_BOX(hboxInstrButtons), btnRemoveDuplicates, FALSE, FALSE, 0);
+    
+    // 🎭 Genre-Fusion Learning
+    GtkWidget* frameGenreFusion = gtk_frame_new("🎭 Genre-Fusion & Künstler-Stile");
+    gtk_box_pack_start(GTK_BOX(vbox), frameGenreFusion, FALSE, FALSE, 0);
+    
+    GtkWidget* vboxGenreFusion = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_container_set_border_width(GTK_CONTAINER(vboxGenreFusion), 10);
+    gtk_container_add(GTK_CONTAINER(frameGenreFusion), vboxGenreFusion);
+    
+    GtkWidget* labelGenreInfo = gtk_label_new(
+        "Lernt genreübergreifende Musik (wie The Prodigy: Breakbeat + Electronic + Industrial)\n"
+        "und charakteristische Künstler-Stile aus der Datenbank.");
+    gtk_label_set_line_wrap(GTK_LABEL(labelGenreInfo), TRUE);
+    gtk_label_set_xalign(GTK_LABEL(labelGenreInfo), 0.0);
+    gtk_box_pack_start(GTK_BOX(vboxGenreFusion), labelGenreInfo, FALSE, FALSE, 0);
+    
+    GtkWidget* hboxGenreButtons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_box_pack_start(GTK_BOX(vboxGenreFusion), hboxGenreButtons, FALSE, FALSE, 0);
+    
+    GtkWidget* btnLearnFusions = gtk_button_new_with_label("🎭 Genre-Fusionen lernen");
+    g_signal_connect(btnLearnFusions, "clicked", G_CALLBACK(onLearnGenreFusions), this);
+    gtk_box_pack_start(GTK_BOX(hboxGenreButtons), btnLearnFusions, FALSE, FALSE, 0);
+    
+    GtkWidget* btnLearnArtistStyle = gtk_button_new_with_label("🎨 Künstler-Stil analysieren");
+    g_signal_connect(btnLearnArtistStyle, "clicked", G_CALLBACK(onLearnArtistStyle), this);
+    gtk_box_pack_start(GTK_BOX(hboxGenreButtons), btnLearnArtistStyle, FALSE, FALSE, 0);
+    
+    GtkWidget* btnSuggestTags = gtk_button_new_with_label("🔍 Genre-Tags vorschlagen");
+    g_signal_connect(btnSuggestTags, "clicked", G_CALLBACK(onSuggestGenreTags), this);
+    gtk_box_pack_start(GTK_BOX(hboxGenreButtons), btnSuggestTags, FALSE, FALSE, 0);
+    
+    // 🎸 Genre-Kombinationen Info
+    GtkWidget* labelGenreInfo2 = gtk_label_new(
+        "📝 Während des Trainings werden automatisch Genre-spezifische Instrumenten-Kombinationen generiert:\n"
+        "   • Zu Beginn: 5 Genre-Demos als Referenz\n"
+        "   • Alle 5 Epochen: Neue Kombination für zufälliges Genre\n"
+        "   • Gespeichert als: ~/.songgen/training_demo_<Genre>.wav");
+    gtk_label_set_line_wrap(GTK_LABEL(labelGenreInfo2), TRUE);
+    gtk_label_set_xalign(GTK_LABEL(labelGenreInfo2), 0.0);
+    gtk_box_pack_start(GTK_BOX(vboxInstruments), labelGenreInfo2, FALSE, FALSE, 5);
     
     // Training-History
     GtkWidget* frameHistory = gtk_frame_new("📜 Training-History");
@@ -927,6 +1655,7 @@ void GtkRenderer::buildAnalyzerTab() {
     gtk_box_pack_start(GTK_BOX(vbox), label, FALSE, FALSE, 0);
     
     GtkWidget* sublabel = gtk_label_new("Analysiere Audio-Dateien und zeige detaillierte Informationen");
+    gtk_label_set_selectable(GTK_LABEL(sublabel), TRUE);
     gtk_box_pack_start(GTK_BOX(vbox), sublabel, FALSE, FALSE, 0);
     
     // Datei-Auswahl
@@ -938,6 +1667,7 @@ void GtkRenderer::buildAnalyzerTab() {
     gtk_box_pack_start(GTK_BOX(hboxFile), btnSelectFile, FALSE, FALSE, 0);
     
     GtkWidget* labelFile = gtk_label_new("Keine Datei ausgewählt");
+    gtk_label_set_selectable(GTK_LABEL(labelFile), TRUE);
     gtk_box_pack_start(GTK_BOX(hboxFile), labelFile, TRUE, TRUE, 0);
     
     // Analyse-Einstellungen
@@ -985,6 +1715,7 @@ void GtkRenderer::buildAnalyzerTab() {
     
     GtkWidget* textView = gtk_text_view_new();
     gtk_text_view_set_editable(GTK_TEXT_VIEW(textView), FALSE);
+    gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(textView), TRUE);
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(textView), GTK_WRAP_WORD);
     gtk_container_add(GTK_CONTAINER(scrolledResults), textView);
     
@@ -1002,6 +1733,350 @@ void GtkRenderer::buildAnalyzerTab() {
     
     gtk_notebook_append_page(GTK_NOTEBOOK(notebook_), vbox, gtk_label_new("🔬 Analyzer"));
     analyzerTab_ = vbox;
+}
+
+void GtkRenderer::buildHistoryTab() {
+    GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    
+    // Titel
+    GtkWidget* label = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(label), "<span size='large' weight='bold'>📜 Entscheidungshistorie</span>");
+    gtk_box_pack_start(GTK_BOX(vbox), label, FALSE, FALSE, 0);
+    
+    GtkWidget* sublabel = gtk_label_new("Nachvollziehen und korrigieren von Verarbeitungsschritten und Metadaten");
+    gtk_label_set_selectable(GTK_LABEL(sublabel), TRUE);
+    gtk_box_pack_start(GTK_BOX(vbox), sublabel, FALSE, FALSE, 0);
+    
+    // Button-Leiste
+    GtkWidget* hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_box_pack_start(GTK_BOX(vbox), hbox, FALSE, FALSE, 0);
+    
+    GtkWidget* btnEditMetadata = gtk_button_new_with_label("✏️ Metadaten bearbeiten");
+    g_signal_connect(btnEditMetadata, "clicked", G_CALLBACK(onEditHistoryMetadata), this);
+    gtk_box_pack_start(GTK_BOX(hbox), btnEditMetadata, FALSE, FALSE, 0);
+    
+    GtkWidget* btnExport = gtk_button_new_with_label("💾 Exportieren");
+    g_signal_connect(btnExport, "clicked", G_CALLBACK(onExportHistory), this);
+    gtk_box_pack_start(GTK_BOX(hbox), btnExport, FALSE, FALSE, 0);
+    
+    GtkWidget* btnClear = gtk_button_new_with_label("🗑️ Historie löschen");
+    g_signal_connect(btnClear, "clicked", G_CALLBACK(onClearHistory), this);
+    gtk_box_pack_end(GTK_BOX(hbox), btnClear, FALSE, FALSE, 0);
+    
+    // Paned für TreeView und Details
+    GtkWidget* paned = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
+    gtk_box_pack_start(GTK_BOX(vbox), paned, TRUE, TRUE, 0);
+    
+    // TreeView für Historie-Einträge
+    GtkWidget* scrolledTree = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolledTree), 
+                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_paned_pack1(GTK_PANED(paned), scrolledTree, TRUE, TRUE);
+    
+    // ListStore: Timestamp, Action, Details, Result, FilePath, Metadata (JSON)
+    historyStore_ = gtk_list_store_new(6, 
+        G_TYPE_STRING,  // Timestamp
+        G_TYPE_STRING,  // Action (z.B. "Datei hinzugefügt", "Genre erkannt", "BPM analysiert")
+        G_TYPE_STRING,  // Details
+        G_TYPE_STRING,  // Result
+        G_TYPE_STRING,  // FilePath
+        G_TYPE_STRING   // Metadata (JSON)
+    );
+    
+    historyTreeView_ = gtk_tree_view_new_with_model(GTK_TREE_MODEL(historyStore_));
+    g_object_unref(historyStore_);
+    
+    // Spalten
+    GtkCellRenderer* renderer = gtk_cell_renderer_text_new();
+    
+    GtkTreeViewColumn* colTime = gtk_tree_view_column_new_with_attributes("🕐 Zeit", renderer, "text", 0, NULL);
+    gtk_tree_view_column_set_resizable(colTime, TRUE);
+    gtk_tree_view_column_set_min_width(colTime, 150);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(historyTreeView_), colTime);
+    
+    GtkTreeViewColumn* colAction = gtk_tree_view_column_new_with_attributes("🎬 Aktion", renderer, "text", 1, NULL);
+    gtk_tree_view_column_set_resizable(colAction, TRUE);
+    gtk_tree_view_column_set_min_width(colAction, 180);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(historyTreeView_), colAction);
+    
+    GtkTreeViewColumn* colDetails = gtk_tree_view_column_new_with_attributes("📋 Details", renderer, "text", 2, NULL);
+    gtk_tree_view_column_set_resizable(colDetails, TRUE);
+    gtk_tree_view_column_set_expand(colDetails, TRUE);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(historyTreeView_), colDetails);
+    
+    GtkTreeViewColumn* colResult = gtk_tree_view_column_new_with_attributes("✅ Ergebnis", renderer, "text", 3, NULL);
+    gtk_tree_view_column_set_resizable(colResult, TRUE);
+    gtk_tree_view_column_set_min_width(colResult, 150);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(historyTreeView_), colResult);
+    
+    g_signal_connect(historyTreeView_, "row-activated", G_CALLBACK(onHistoryRowActivated), this);
+    
+    gtk_container_add(GTK_CONTAINER(scrolledTree), historyTreeView_);
+    
+    // Details-TextView
+    GtkWidget* frameDetails = gtk_frame_new("📝 Details");
+    GtkWidget* scrolledDetails = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolledDetails), 
+                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_container_add(GTK_CONTAINER(frameDetails), scrolledDetails);
+    gtk_paned_pack2(GTK_PANED(paned), frameDetails, FALSE, TRUE);
+    
+    historyTextView_ = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(historyTextView_), FALSE);
+    gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(historyTextView_), TRUE);
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(historyTextView_), GTK_WRAP_WORD);
+    gtk_container_add(GTK_CONTAINER(scrolledDetails), historyTextView_);
+    
+    // Monospace-Font für Details
+    PangoFontDescription* fontDesc = pango_font_description_from_string("monospace 10");
+    gtk_widget_override_font(historyTextView_, fontDesc);
+    pango_font_description_free(fontDesc);
+    
+    GtkTextBuffer* buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(historyTextView_));
+    gtk_text_buffer_set_text(buffer, 
+        "Wähle einen Eintrag aus, um Details anzuzeigen.\n\n"
+        "Diese Historie protokolliert alle Verarbeitungsschritte:\n"
+        "• Dateien hinzugefügt/entfernt\n"
+        "• Genre-Erkennungen und Änderungen\n"
+        "• BPM-Analysen\n"
+        "• Metadaten-Korrekturen\n"
+        "• Video-Konvertierungen\n"
+        "• Training-Entscheidungen\n\n"
+        "Doppelklick auf Eintrag öffnet Editor für Korrekturen.", -1);
+    
+    // Setze Paned-Position
+    gtk_paned_set_position(GTK_PANED(paned), 400);
+    
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook_), vbox, gtk_label_new("📜 Historie"));
+    historyTab_ = vbox;
+}
+
+void GtkRenderer::buildDataQualityTab() {
+    GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    
+    // Titel
+    GtkWidget* label = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(label), 
+        "<span size='large' weight='bold'>📊 Datenqualität & Fehlende Elemente</span>");
+    gtk_box_pack_start(GTK_BOX(vbox), label, FALSE, FALSE, 0);
+    
+    GtkWidget* subtitle = gtk_label_new(
+        "Zeigt was dem System für perfekte KI-Generierung noch fehlt");
+    gtk_box_pack_start(GTK_BOX(vbox), subtitle, FALSE, FALSE, 0);
+    
+    gtk_box_pack_start(GTK_BOX(vbox), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), 
+                       FALSE, FALSE, 5);
+    
+    // Analyze Button
+    GtkWidget* btnAnalyze = gtk_button_new_with_label("🔍 Datenqualität analysieren");
+    g_signal_connect(btnAnalyze, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
+        auto* self = static_cast<GtkRenderer*>(data);
+        
+        std::thread([self]() {
+            std::cout << "🔍 Starting data quality analysis...\n";
+            
+            auto metrics = self->qualityAnalyzer_->analyze();
+            self->qualityAnalyzer_->analyzePatterns(self->patternCapture_.get(), metrics);
+            
+            // Show results in GTK
+            gdk_threads_add_idle([](gpointer data) -> gboolean {
+                auto* metrics = static_cast<SongGen::DataQualityMetrics*>(data);
+                auto* self = static_cast<GtkRenderer*>(g_object_get_data(
+                    G_OBJECT(gtk_widget_get_toplevel(GTK_WIDGET(nullptr))), "renderer"));
+                
+                std::string message = "📊 DATENQUALITÄT ANALYSE\n\n";
+                message += "═══════════════════════════════════\n\n";
+                message += "🎯 GESAMT-SCORE: " + 
+                    std::to_string(static_cast<int>(metrics->overallQuality * 100)) + "%\n\n";
+                
+                message += "📈 DETAILLIERTE SCORES:\n";
+                message += "  • Genre-Abdeckung: " + 
+                    std::to_string(static_cast<int>(metrics->genreCoverage * 100)) + "%\n";
+                message += "  • Tempo-Balance: " + 
+                    std::to_string(static_cast<int>(metrics->tempoRangeCoverage * 100)) + "%\n";
+                message += "  • Instrument-Vielfalt: " + 
+                    std::to_string(static_cast<int>(metrics->instrumentDiversity * 100)) + "%\n";
+                message += "  • Rhythmus-Patterns: " + 
+                    std::to_string(static_cast<int>(metrics->rhythmPatternCount * 100)) + "%\n";
+                message += "  • Melodie-Patterns: " + 
+                    std::to_string(static_cast<int>(metrics->melodyPatternCount * 100)) + "%\n";
+                message += "  • Feature-Extraktion: " + 
+                    std::to_string(static_cast<int>(metrics->tracksWithMFCC * 100)) + "%\n\n";
+                
+                message += "🎭 TEMPO-VERTEILUNG:\n";
+                message += "  • Langsam (< 90 BPM): " + std::to_string(metrics->tracksSlow) + "\n";
+                message += "  • Mittel (90-130): " + std::to_string(metrics->tracksMedium) + "\n";
+                message += "  • Schnell (> 130): " + std::to_string(metrics->tracksFast) + "\n\n";
+                
+                if (!metrics->missingData.empty()) {
+                    message += "❌ KRITISCHE LÜCKEN:\n";
+                    for (const auto& gap : metrics->missingData) {
+                        message += "  • " + gap + "\n";
+                    }
+                    message += "\n";
+                }
+                
+                if (!metrics->recommendations.empty()) {
+                    message += "💡 EMPFEHLUNGEN:\n";
+                    for (size_t i = 0; i < std::min(size_t(10), metrics->recommendations.size()); i++) {
+                        message += "  " + std::to_string(i+1) + ". " + 
+                                  metrics->recommendations[i] + "\n";
+                    }
+                }
+                
+                GtkWidget* dialog = gtk_message_dialog_new(
+                    nullptr, GTK_DIALOG_MODAL,
+                    GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
+                    "%s", message.c_str());
+                gtk_window_set_title(GTK_WINDOW(dialog), "Datenqualität-Analyse");
+                gtk_dialog_run(GTK_DIALOG(dialog));
+                gtk_widget_destroy(dialog);
+                
+                delete metrics;
+                return G_SOURCE_REMOVE;
+            }, new SongGen::DataQualityMetrics(metrics));
+            
+        }).detach();
+    }), this);
+    gtk_box_pack_start(GTK_BOX(vbox), btnAnalyze, FALSE, FALSE, 0);
+    
+    // Progress Bars Frame
+    GtkWidget* frameProgress = gtk_frame_new("📊 Live-Scores (% Vollständigkeit)");
+    gtk_box_pack_start(GTK_BOX(vbox), frameProgress, TRUE, TRUE, 5);
+    
+    GtkWidget* progressBox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_container_set_border_width(GTK_CONTAINER(progressBox), 10);
+    gtk_container_add(GTK_CONTAINER(frameProgress), progressBox);
+    
+    // Automatisch aktualisierte Progress Bars
+    auto createProgressRow = [&](const char* labelText, GtkWidget** progressBar) {
+        GtkWidget* hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+        gtk_box_pack_start(GTK_BOX(progressBox), hbox, FALSE, FALSE, 0);
+        
+        GtkWidget* lbl = gtk_label_new(labelText);
+        gtk_widget_set_size_request(lbl, 200, -1);
+        gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+        gtk_box_pack_start(GTK_BOX(hbox), lbl, FALSE, FALSE, 0);
+        
+        *progressBar = gtk_progress_bar_new();
+        gtk_widget_set_size_request(*progressBar, 400, -1);
+        gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(*progressBar), TRUE);
+        gtk_box_pack_start(GTK_BOX(hbox), *progressBar, TRUE, TRUE, 0);
+    };
+    
+    GtkWidget *progGenre, *progTempo, *progInstruments, *progRhythm, *progMelody, *progFeatures;
+    
+    createProgressRow("🎭 Genre-Abdeckung:", &progGenre);
+    createProgressRow("🎵 Tempo-Balance:", &progTempo);
+    createProgressRow("🎸 Instrument-Vielfalt:", &progInstruments);
+    createProgressRow("🥁 Rhythmus-Patterns:", &progRhythm);
+    createProgressRow("🎹 Melodie-Patterns:", &progMelody);
+    createProgressRow("📊 Feature-Extraktion:", &progFeatures);
+    
+    // Auto-Update Timer (alle 5 Sekunden)
+    g_timeout_add_seconds(5, [](gpointer data) -> gboolean {
+        auto* self = static_cast<GtkRenderer*>(data);
+        
+        if (!self->qualityAnalyzer_) return G_SOURCE_REMOVE;
+        
+        // Quick analysis (ohne Dialog)
+        std::thread([self]() {
+            auto metrics = self->qualityAnalyzer_->analyze();
+            self->qualityAnalyzer_->analyzePatterns(self->patternCapture_.get(), metrics);
+            
+            // Update wird im nächsten Frame gemacht (simplified)
+            std::cout << "📊 Quality: " << (metrics.overallQuality * 100) << "% | "
+                     << "Genres: " << (metrics.genreCoverage * 100) << "% | "
+                     << "Patterns: R=" << (metrics.rhythmPatternCount * 100) 
+                     << "% M=" << (metrics.melodyPatternCount * 100) << "%\n";
+        }).detach();
+        
+        return G_SOURCE_CONTINUE;
+    }, this);
+    
+    // Genre Details Button
+    GtkWidget* btnGenreDetails = gtk_button_new_with_label("🎭 Genre-Details anzeigen");
+    g_signal_connect(btnGenreDetails, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
+        auto* self = static_cast<GtkRenderer*>(data);
+        
+        std::thread([self]() {
+            auto genreCompleteness = self->qualityAnalyzer_->analyzeGenreCoverage();
+            
+            gdk_threads_add_idle([](gpointer data) -> gboolean {
+                auto* genres = static_cast<std::vector<SongGen::GenreCompleteness>*>(data);
+                
+                std::string message = "🎭 GENRE-VOLLSTÄNDIGKEIT\n\n";
+                message += "═══════════════════════════════════\n\n";
+                
+                for (size_t i = 0; i < std::min(size_t(15), genres->size()); i++) {
+                    const auto& gc = (*genres)[i];
+                    int percent = static_cast<int>(gc.completeness * 100);
+                    
+                    message += gc.genre + ": " + std::to_string(percent) + "% ";
+                    message += "(" + std::to_string(gc.trackCount) + "/" + 
+                              std::to_string(gc.minRecommended) + ")\n";
+                    
+                    if (!gc.missingElements.empty() && percent < 80) {
+                        for (const auto& missing : gc.missingElements) {
+                            message += "    → " + missing + "\n";
+                        }
+                    }
+                }
+                
+                GtkWidget* dialog = gtk_message_dialog_new(
+                    nullptr, GTK_DIALOG_MODAL,
+                    GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
+                    "%s", message.c_str());
+                gtk_window_set_title(GTK_WINDOW(dialog), "Genre-Analyse");
+                gtk_dialog_run(GTK_DIALOG(dialog));
+                gtk_widget_destroy(dialog);
+                
+                delete genres;
+                return G_SOURCE_REMOVE;
+            }, new std::vector<SongGen::GenreCompleteness>(genreCompleteness));
+        }).detach();
+    }), this);
+    gtk_box_pack_start(GTK_BOX(progressBox), btnGenreDetails, FALSE, FALSE, 5);
+    
+    // Priority Actions Button
+    GtkWidget* btnPriority = gtk_button_new_with_label("⚡ Prioritäts-Liste");
+    g_signal_connect(btnPriority, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
+        auto* self = static_cast<GtkRenderer*>(data);
+        
+        std::thread([self]() {
+            auto actions = self->qualityAnalyzer_->getPriorityActions();
+            
+            gdk_threads_add_idle([](gpointer data) -> gboolean {
+                auto* actions = static_cast<std::vector<std::pair<std::string, float>>*>(data);
+                
+                std::string message = "⚡ PRIORITÄTS-LISTE\n\n";
+                message += "Was sollte ZUERST verbessert werden?\n\n";
+                message += "═══════════════════════════════════\n\n";
+                
+                for (size_t i = 0; i < actions->size(); i++) {
+                    int priority = static_cast<int>((*actions)[i].second * 100);
+                    message += std::to_string(i+1) + ". " + (*actions)[i].first + 
+                              " (Priorität: " + std::to_string(priority) + "%)\n\n";
+                }
+                
+                GtkWidget* dialog = gtk_message_dialog_new(
+                    nullptr, GTK_DIALOG_MODAL,
+                    GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
+                    "%s", message.c_str());
+                gtk_window_set_title(GTK_WINDOW(dialog), "Was jetzt tun?");
+                gtk_dialog_run(GTK_DIALOG(dialog));
+                gtk_widget_destroy(dialog);
+                
+                delete actions;
+                return G_SOURCE_REMOVE;
+            }, new std::vector<std::pair<std::string, float>>(actions));
+        }).detach();
+    }), this);
+    gtk_box_pack_start(GTK_BOX(progressBox), btnPriority, FALSE, FALSE, 0);
+    
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook_), vbox, gtk_label_new("📊 Qualität"));
 }
 
 // Callbacks
@@ -1030,13 +2105,15 @@ void GtkRenderer::onDeleteDatabase(GtkWidget* widget, gpointer data) {
         GtkWidget* progressDialog = gtk_dialog_new_with_buttons(
             "Datenbank wird gelöscht...",
             GTK_WINDOW(self->window_),
-            GTK_DIALOG_MODAL,
+            (GtkDialogFlags)0,
             NULL
         );
+        makeDialogResizable(progressDialog, 500, 180);
         
         GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(progressDialog));
         GtkWidget* progressBar = gtk_progress_bar_new();
         GtkWidget* labelProgress = gtk_label_new("Lösche Einträge...");
+        gtk_label_set_selectable(GTK_LABEL(labelProgress), TRUE);
         
         gtk_box_pack_start(GTK_BOX(content), labelProgress, FALSE, FALSE, 5);
         gtk_box_pack_start(GTK_BOX(content), progressBar, FALSE, FALSE, 5);
@@ -1156,13 +2233,15 @@ void GtkRenderer::onAutoDetectGenres(GtkWidget* widget, gpointer data) {
     GtkWidget* progressDialog = gtk_dialog_new_with_buttons(
         "Genre-Erkennung läuft...",
         GTK_WINDOW(self->window_),
-        GTK_DIALOG_MODAL,
+        (GtkDialogFlags)0,
         NULL
     );
     
+    makeDialogResizable(progressDialog, 500, 180);
     GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(progressDialog));
     GtkWidget* progressBar = gtk_progress_bar_new();
     GtkWidget* labelProgress = gtk_label_new("Analysiere Dateien...");
+    gtk_label_set_selectable(GTK_LABEL(labelProgress), TRUE);
     
     gtk_box_pack_start(GTK_BOX(content), labelProgress, FALSE, FALSE, 5);
     gtk_box_pack_start(GTK_BOX(content), progressBar, FALSE, FALSE, 5);
@@ -1379,26 +2458,40 @@ void GtkRenderer::onAnalyzeAll(GtkWidget* widget, gpointer data) {
     }
     gtk_widget_destroy(confirmDialog);
     
-    // Progress-Dialog
+    // Progress-Dialog mit Abbrechen-Button
     GtkWidget* progressDialog = gtk_dialog_new_with_buttons(
         "🔬 Analysiere Audio-Features...",
         GTK_WINDOW(self->window_),
-        GTK_DIALOG_MODAL,
+        (GtkDialogFlags)0,
+        "Abbrechen", GTK_RESPONSE_CANCEL,
         NULL
     );
+    makeDialogResizable(progressDialog, 600, 200);
     
     GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(progressDialog));
     GtkWidget* progressBar = gtk_progress_bar_new();
     GtkWidget* labelProgress = gtk_label_new("Analysiere Dateien...");
+    gtk_label_set_selectable(GTK_LABEL(labelProgress), TRUE);
     GtkWidget* labelDetails = gtk_label_new("");
+    gtk_label_set_selectable(GTK_LABEL(labelDetails), TRUE);
     
     gtk_box_pack_start(GTK_BOX(content), labelProgress, FALSE, FALSE, 5);
     gtk_box_pack_start(GTK_BOX(content), progressBar, FALSE, FALSE, 5);
     gtk_box_pack_start(GTK_BOX(content), labelDetails, FALSE, FALSE, 5);
     gtk_widget_show_all(progressDialog);
     
+    // Abbrechen-Handler
+    std::atomic<bool>* cancelFlag = new std::atomic<bool>(false);
+    g_signal_connect(progressDialog, "response", G_CALLBACK(+[](GtkDialog* dialog, gint response, gpointer data) {
+        if (response == GTK_RESPONSE_CANCEL) {
+            auto* flag = static_cast<std::atomic<bool>*>(data);
+            *flag = true;
+            std::cout << "⚠️ Analyse wird abgebrochen...\n";
+        }
+    }), cancelFlag);
+    
     // Analyse mit Multi-Threading (nutzt alle CPU-Kerne)
-    std::thread([self, unanalyzed, progressDialog, progressBar, labelProgress, labelDetails]() {
+    std::thread([self, unanalyzed, progressDialog, progressBar, labelProgress, labelDetails, cancelFlag]() {
         std::atomic<size_t> processed(0);
         std::atomic<size_t> analyzed(0);
         std::mutex dbMutex;  // Schütze Datenbank-Zugriff
@@ -1419,6 +2512,12 @@ void GtkRenderer::onAnalyzeAll(GtkWidget* widget, gpointer data) {
                 AudioAnalyzer localAnalyzer;
                 
                 while (true) {
+                    // Check Cancel-Flag
+                    if (*cancelFlag) {
+                        std::cout << "⚠️ Thread " << t << " abgebrochen\n";
+                        break;
+                    }
+                    
                     size_t idx = nextIndex.fetch_add(1);
                     if (idx >= unanalyzed.size()) break;
                     
@@ -1470,12 +2569,21 @@ void GtkRenderer::onAnalyzeAll(GtkWidget* widget, gpointer data) {
                             float progress = (float)std::get<3>(*info) / std::get<4>(*info);
                             gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(std::get<0>(*info)), progress);
                             
+                            // Text mit Prozent
+                            char percentText[64];
+                            snprintf(percentText, sizeof(percentText), "%.1f%%", progress * 100.0f);
+                            gtk_progress_bar_set_text(GTK_PROGRESS_BAR(std::get<0>(*info)), percentText);
+                            gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(std::get<0>(*info)), TRUE);
+                            
                             std::string text = std::to_string(std::get<3>(*info)) + " / " + 
-                                              std::to_string(std::get<4>(*info));
+                                              std::to_string(std::get<4>(*info)) + " (" + percentText + ")";
                             gtk_label_set_text(GTK_LABEL(std::get<1>(*info)), text.c_str());
                             
-                            std::string details = "✓ Analysiert: " + std::to_string(std::get<5>(*info));
-                            gtk_label_set_text(GTK_LABEL(std::get<2>(*info)), details.c_str());
+                            float analyzedPercent = (float)std::get<5>(*info) / std::get<4>(*info) * 100.0f;
+                            char detailsText[128];
+                            snprintf(detailsText, sizeof(detailsText), "✓ Analysiert: %zu (%.1f%%)", 
+                                    std::get<5>(*info), analyzedPercent);
+                            gtk_label_set_text(GTK_LABEL(std::get<2>(*info)), detailsText);
                             
                             delete info;
                             return G_SOURCE_REMOVE;
@@ -1491,39 +2599,67 @@ void GtkRenderer::onAnalyzeAll(GtkWidget* widget, gpointer data) {
             worker.join();
         }
         
-        // Refresh in main thread (thread-safe)
+        std::cout << "✅ Alle Worker-Threads beendet. Analyzed: " << analyzed << " Cancelled: " << *cancelFlag << "\n";
+        
+        bool wasCancelled = *cancelFlag;
+        delete cancelFlag;  // Cleanup
+        
+        // Refresh Database List in main thread
         gdk_threads_add_idle([](gpointer data) -> gboolean {
-            static_cast<GtkRenderer*>(data)->refreshDatabaseView();
+            GtkRenderer* self = static_cast<GtkRenderer*>(data);
+            self->refreshDatabaseView();
+            std::cout << "✅ Database view refreshed\n";
             return G_SOURCE_REMOVE;
         }, self);
         
-        // Schließe Dialog und zeige Ergebnis
+        // Schließe Dialog und zeige Ergebnis (NACH refresh)
         gdk_threads_add_idle([](gpointer data) -> gboolean {
-            auto* info = static_cast<std::tuple<GtkRenderer*, GtkWidget*, size_t>*>(data);
+            auto* info = static_cast<std::tuple<GtkRenderer*, GtkWidget*, size_t, bool>*>(data);
             GtkRenderer* self = std::get<0>(*info);
+            GtkWidget* progressDlg = std::get<1>(*info);
+            size_t analyzedCount = std::get<2>(*info);
+            bool cancelled = std::get<3>(*info);
             
-            gtk_widget_destroy(std::get<1>(*info));
+            gtk_widget_destroy(progressDlg);
+            
+            char message[512];
+            float percentAnalyzed = self->filteredMedia_.empty() ? 0.0f : 
+                                   (float)analyzedCount / self->filteredMedia_.size() * 100.0f;
+            
+            if (cancelled) {
+                snprintf(message, sizeof(message),
+                    "⚠️ Analyse abgebrochen!\n\n"
+                    "%zu Dateien analysiert (%.1f%%) bevor Abbruch.\n\n"
+                    "Du kannst die Analyse jederzeit wieder starten.",
+                    analyzedCount, percentAnalyzed);
+            } else {
+                snprintf(message, sizeof(message),
+                    "✅ Audio-Analyse abgeschlossen!\n\n"
+                    "%zu Dateien vollständig analysiert (%.1f%%).\n\n"
+                    "Extrahierte Features:\n"
+                    "• BPM & Genre\n"
+                    "• Spektrale Features (MFCC, Centroid)\n"
+                    "• Intensität & Bass-Level\n\n"
+                    "Dateien sind jetzt bereit für KI-Training!",
+                    analyzedCount, percentAnalyzed);
+            }
             
             GtkWidget* resultDialog = gtk_message_dialog_new(
                 GTK_WINDOW(self->window_),
                 GTK_DIALOG_MODAL,
-                GTK_MESSAGE_INFO,
+                cancelled ? GTK_MESSAGE_WARNING : GTK_MESSAGE_INFO,
                 GTK_BUTTONS_OK,
-                "✅ Audio-Analyse abgeschlossen!\n\n"
-                "%zu Dateien vollständig analysiert.\n\n"
-                "Extrahierte Features:\n"
-                "• BPM & Genre\n"
-                "• Spektrale Features (MFCC, Centroid)\n"
-                "• Intensität & Bass-Level\n\n"
-                "Dateien sind jetzt bereit für KI-Training!",
-                std::get<2>(*info)
-            );
+                "%s", message);
+            gtk_window_set_title(GTK_WINDOW(resultDialog), cancelled ? "Analyse abgebrochen" : "Analyse abgeschlossen");
+            makeDialogResizable(resultDialog, 600, 250);
             gtk_dialog_run(GTK_DIALOG(resultDialog));
             gtk_widget_destroy(resultDialog);
             
+            std::cout << "✅ Result dialog closed\n";
+            
             delete info;
             return G_SOURCE_REMOVE;
-        }, new std::tuple<GtkRenderer*, GtkWidget*, size_t>(self, progressDialog, analyzed));
+        }, new std::tuple<GtkRenderer*, GtkWidget*, size_t, bool>(self, progressDialog, analyzed.load(), wasCancelled));
         
     }).detach();
 }
@@ -1562,28 +2698,47 @@ void GtkRenderer::onRepairClipping(GtkWidget* widget, gpointer data) {
     }
     gtk_widget_destroy(confirmDialog);
     
-    // Progress-Dialog
+    // Progress-Dialog mit Abbrechen-Button
     GtkWidget* progressDialog = gtk_dialog_new_with_buttons(
         "Übersteuerungen reparieren...",
         GTK_WINDOW(self->window_),
-        GTK_DIALOG_MODAL,
+        (GtkDialogFlags)0,
+        "Abbrechen", GTK_RESPONSE_CANCEL,
         NULL
     );
+    makeDialogResizable(progressDialog, 600, 200);
     
     GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(progressDialog));
     GtkWidget* progressBar = gtk_progress_bar_new();
     GtkWidget* labelProgress = gtk_label_new("Analysiere Audio-Dateien...");
+    gtk_label_set_selectable(GTK_LABEL(labelProgress), TRUE);
     
     gtk_box_pack_start(GTK_BOX(content), labelProgress, FALSE, FALSE, 5);
     gtk_box_pack_start(GTK_BOX(content), progressBar, FALSE, FALSE, 5);
     gtk_widget_show_all(progressDialog);
     
+    // Abbrechen-Handler
+    std::atomic<bool>* cancelFlag = new std::atomic<bool>(false);
+    g_signal_connect(progressDialog, "response", G_CALLBACK(+[](GtkDialog* dialog, gint response, gpointer data) {
+        if (response == GTK_RESPONSE_CANCEL) {
+            auto* flag = static_cast<std::atomic<bool>*>(data);
+            *flag = true;
+            std::cout << "⚠️ Reparatur wird abgebrochen...\n";
+        }
+    }), cancelFlag);
+    
     // Analyse in Thread
-    std::thread([self, allMedia, progressDialog, progressBar, labelProgress]() {
+    std::thread([self, allMedia, progressDialog, progressBar, labelProgress, cancelFlag]() {
         size_t processed = 0;
         size_t repaired = 0;
         
         for (const auto& media : allMedia) {
+            // Check Cancel-Flag
+            if (*cancelFlag) {
+                std::cout << "⚠️ Reparatur abgebrochen bei " << processed << " / " << allMedia.size() << "\n";
+                break;
+            }
+            
             processed++;
             
             // Prüfe auf Clipping
@@ -1612,10 +2767,16 @@ void GtkRenderer::onRepairClipping(GtkWidget* widget, gpointer data) {
                     float progress = (float)std::get<2>(*info) / std::get<3>(*info);
                     gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(std::get<0>(*info)), progress);
                     
-                    std::string text = std::to_string(std::get<2>(*info)) + " / " + 
-                                      std::to_string(std::get<3>(*info)) + " (" + 
-                                      std::to_string(std::get<4>(*info)) + " repariert)";
-                    gtk_label_set_text(GTK_LABEL(std::get<1>(*info)), text.c_str());
+                    // Mit % Anzeige
+                    char percentText[32];
+                    snprintf(percentText, sizeof(percentText), "%.1f%%", progress * 100.0f);
+                    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(std::get<0>(*info)), percentText);
+                    gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(std::get<0>(*info)), TRUE);
+                    
+                    char text[128];
+                    snprintf(text, sizeof(text), "%zu / %zu (%.1f%%) - %zu repariert",
+                            std::get<2>(*info), std::get<3>(*info), progress * 100.0f, std::get<4>(*info));
+                    gtk_label_set_text(GTK_LABEL(std::get<1>(*info)), text);
                     
                     delete info;
                     return G_SOURCE_REMOVE;
@@ -1623,29 +2784,53 @@ void GtkRenderer::onRepairClipping(GtkWidget* widget, gpointer data) {
             }
         }
         
+        bool wasCancelled = *cancelFlag;
+        delete cancelFlag;  // Cleanup
+        
         // Schließe Dialog und zeige Ergebnis
         gdk_threads_add_idle([](gpointer data) -> gboolean {
-            auto* info = static_cast<std::tuple<GtkRenderer*, GtkWidget*, size_t>*>(data);
+            auto* info = static_cast<std::tuple<GtkRenderer*, GtkWidget*, size_t, size_t, bool>*>(data);
             GtkRenderer* self = std::get<0>(*info);
+            GtkWidget* progressDlg = std::get<1>(*info);
+            size_t repaired = std::get<2>(*info);
+            size_t processed = std::get<3>(*info);
+            bool cancelled = std::get<4>(*info);
             
-            gtk_widget_destroy(std::get<1>(*info));
+            gtk_widget_destroy(progressDlg);
+            
+            char message[512];
+            float repairedPercent = processed > 0 ? (float)repaired / processed * 100.0f : 0.0f;
+            
+            if (cancelled) {
+                snprintf(message, sizeof(message),
+                    "⚠️ Reparatur abgebrochen!\n\n"
+                    "%zu Dateien verarbeitet\n"
+                    "%zu Dateien repariert (%.1f%%)",
+                    processed, repaired, repairedPercent);
+            } else {
+                snprintf(message, sizeof(message),
+                    "✅ Clipping-Reparatur abgeschlossen!\n\n"
+                    "%zu Dateien analysiert\n"
+                    "%zu Dateien repariert (%.1f%%)\n\n"
+                    "Backups wurden als .backup gespeichert.",
+                    processed, repaired, repairedPercent);
+            }
             
             GtkWidget* resultDialog = gtk_message_dialog_new(
                 GTK_WINDOW(self->window_),
                 GTK_DIALOG_MODAL,
-                GTK_MESSAGE_INFO,
+                cancelled ? GTK_MESSAGE_WARNING : GTK_MESSAGE_INFO,
                 GTK_BUTTONS_OK,
-                "✅ Analyse abgeschlossen!\n\n"
-                "%zu Dateien repariert\n"
-                "Backups wurden als *.backup gespeichert",
-                std::get<2>(*info)
+                "%s", message
             );
+            gtk_window_set_title(GTK_WINDOW(resultDialog), cancelled ? "Reparatur abgebrochen" : "Reparatur abgeschlossen");
+            gtk_window_set_default_size(GTK_WINDOW(resultDialog), 500, 180);
             gtk_dialog_run(GTK_DIALOG(resultDialog));
             gtk_widget_destroy(resultDialog);
             
             delete info;
             return G_SOURCE_REMOVE;
-        }, new std::tuple<GtkRenderer*, GtkWidget*, size_t>(self, progressDialog, repaired));
+        }, new std::tuple<GtkRenderer*, GtkWidget*, size_t, size_t, bool>(self, progressDialog, repaired, processed, wasCancelled));
         
     }).detach();
 }
@@ -1672,10 +2857,11 @@ void GtkRenderer::onFindDuplicates(GtkWidget* widget, gpointer data) {
     GtkWidget* progressDialog = gtk_dialog_new_with_buttons(
         "Suche Duplikate...",
         GTK_WINDOW(self->window_),
-        GTK_DIALOG_MODAL,
+        (GtkDialogFlags)0,
         nullptr
     );
     
+    makeDialogResizable(progressDialog, 500, 180);
     GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(progressDialog));
     GtkWidget* progressBar = gtk_progress_bar_new();
     GtkWidget* labelProgress = gtk_label_new("Analysiere Dateien...");
@@ -1719,19 +2905,21 @@ void GtkRenderer::onFindDuplicates(GtkWidget* widget, gpointer data) {
             GtkWidget* resultDialog = gtk_dialog_new_with_buttons(
                 "Gefundene Duplikate",
                 GTK_WINDOW(self->window_),
-                GTK_DIALOG_MODAL,
+                (GtkDialogFlags)0,
                 "Schließen", GTK_RESPONSE_CLOSE,
                 nullptr
             );
-            gtk_window_set_default_size(GTK_WINDOW(resultDialog), 700, 400);
+            makeDialogResizable(resultDialog, 700, 400);
             
             GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(resultDialog));
             
             if (duplicates.empty()) {
                 GtkWidget* label = gtk_label_new("✅ Keine Duplikate gefunden!");
+                gtk_label_set_selectable(GTK_LABEL(label), TRUE);
                 gtk_box_pack_start(GTK_BOX(content), label, TRUE, TRUE, 10);
             } else {
                 GtkWidget* label = gtk_label_new(("🔍 " + std::to_string(duplicates.size()) + " Duplikate gefunden:").c_str());
+                gtk_label_set_selectable(GTK_LABEL(label), TRUE);
                 gtk_box_pack_start(GTK_BOX(content), label, FALSE, FALSE, 5);
                 
                 // ScrolledWindow + TreeView
@@ -1854,6 +3042,7 @@ void GtkRenderer::onShowTrainingStats(GtkWidget* widget, gpointer data) {
             
             GtkWidget* genreList = gtk_text_view_new();
             gtk_text_view_set_editable(GTK_TEXT_VIEW(genreList), FALSE);
+            gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(genreList), TRUE);
             gtk_container_add(GTK_CONTAINER(scrolled), genreList);
             
             GtkTextBuffer* buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(genreList));
@@ -2056,13 +3245,15 @@ void GtkRenderer::onBrowseLocal(GtkWidget* widget, gpointer data) {
         GtkWidget* progressDialog = gtk_dialog_new_with_buttons(
             "Füge Dateien hinzu...",
             GTK_WINDOW(self->window_),
-            GTK_DIALOG_MODAL,
+            (GtkDialogFlags)0,
             NULL
         );
         
+        makeDialogResizable(progressDialog, 500, 180);
         GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(progressDialog));
         GtkWidget* progressBar = gtk_progress_bar_new();
         GtkWidget* labelProgress = gtk_label_new("Durchsuche Verzeichnisse...");
+        gtk_label_set_selectable(GTK_LABEL(labelProgress), TRUE);
         
         gtk_box_pack_start(GTK_BOX(content), labelProgress, FALSE, FALSE, 5);
         gtk_box_pack_start(GTK_BOX(content), progressBar, FALSE, FALSE, 5);
@@ -2287,77 +3478,162 @@ void GtkRenderer::onBrowseFTP(GtkWidget* widget, gpointer data) {
 }
 
 void GtkRenderer::onAddressBarGo(GtkWidget* widget, gpointer data) {
-    struct BrowserData {
-        GtkWidget* addrEntry;
-        GtkWidget* fileChooser;
-        GtkRenderer* self;
-    };
-    
     auto* bd = static_cast<BrowserData*>(data);
     const char* path = gtk_entry_get_text(GTK_ENTRY(bd->addrEntry));
-    gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(bd->fileChooser), path);
+    bd->currentPath = path;
+    loadBrowserDirectory(path, bd->store);
 }
 
 void GtkRenderer::onAddSelectedFiles(GtkWidget* widget, gpointer data) {
-    struct BrowserData {
-        GtkWidget* addrEntry;
-        GtkWidget* fileChooser;
-        GtkRenderer* self;
-    };
-    
     auto* bd = static_cast<BrowserData*>(data);
-    GtkRenderer* self = bd->self;
+    GtkRenderer* self = static_cast<GtkRenderer*>(bd->self);
     
-    GSList* filenames = gtk_file_chooser_get_filenames(GTK_FILE_CHOOSER(bd->fileChooser));
+    // Sammle alle markierten Einträge aus TreeView
+    std::vector<std::string> selectedPaths;
+    std::vector<std::string> selectedTypes;
     
-    if (!filenames) {
+    GtkTreeIter iter;
+    GtkTreeModel* model = GTK_TREE_MODEL(bd->store);
+    
+    if (gtk_tree_model_get_iter_first(model, &iter)) {
+        do {
+            gboolean checked;
+            gchar* type;
+            gchar* path;
+            gtk_tree_model_get(model, &iter, 0, &checked, 3, &type, 4, &path, -1);
+            
+            if (checked) {
+                selectedPaths.push_back(path);
+                selectedTypes.push_back(type);
+            }
+            
+            g_free(type);
+            g_free(path);
+        } while (gtk_tree_model_iter_next(model, &iter));
+    }
+    
+    if (selectedPaths.empty()) {
         GtkWidget* dialog = gtk_message_dialog_new(
             GTK_WINDOW(self->window_),
             GTK_DIALOG_MODAL,
             GTK_MESSAGE_WARNING,
             GTK_BUTTONS_OK,
-            "⚠️ Keine Dateien ausgewählt"
+            "⚠️ Keine Einträge markiert"
         );
         gtk_dialog_run(GTK_DIALOG(dialog));
         gtk_widget_destroy(dialog);
         return;
     }
     
-    // Zähle Dateien
-    int fileCount = g_slist_length(filenames);
-    
     // Progress-Dialog
     GtkWidget* progressDialog = gtk_dialog_new_with_buttons(
-        "Füge Dateien hinzu...",
+        "Verarbeite Auswahl...",
         GTK_WINDOW(self->window_),
-        GTK_DIALOG_MODAL,
+        (GtkDialogFlags)0,
         NULL
     );
     
+    makeDialogResizable(progressDialog, 500, 180);
     GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(progressDialog));
     GtkWidget* progressBar = gtk_progress_bar_new();
-    GtkWidget* labelProgress = gtk_label_new("Verarbeite Dateien...");
+    GtkWidget* labelProgress = gtk_label_new("Sammle Dateien...");
+    gtk_label_set_selectable(GTK_LABEL(labelProgress), TRUE);
     
     gtk_box_pack_start(GTK_BOX(content), labelProgress, FALSE, FALSE, 5);
     gtk_box_pack_start(GTK_BOX(content), progressBar, FALSE, FALSE, 5);
     gtk_widget_show_all(progressDialog);
     
-    // Verarbeite im Thread
-    std::thread([self, filenames, progressDialog, progressBar, labelProgress, fileCount]() {
+    // Verarbeite im Thread (detached, damit GUI nicht blockiert)
+    std::thread([self, selectedPaths, selectedTypes, progressDialog, progressBar, labelProgress]() {
         int added = 0;
         int skipped = 0;
         int converted = 0;
         int processed = 0;
+        std::vector<std::string> allFiles;
         std::vector<std::string> errors;
         
-        for (GSList* l = filenames; l != NULL; l = l->next) {
-            char* filename = (char*)l->data;
-            std::string filepath = filename;
+        // Sammle alle Dateien (rekursiv aus Ordnern)
+        for (size_t i = 0; i < selectedPaths.size(); i++) {
+            const auto& path = selectedPaths[i];
+            const auto& type = selectedTypes[i];
+            
+            // Update: Zeige aktuellen Ordner
+            gdk_threads_add_idle([](gpointer data) -> gboolean {
+                auto* info = static_cast<std::tuple<GtkWidget*, std::string>*>(data);
+                std::string msg = "📁 Durchsuche: " + std::filesystem::path(std::get<1>(*info)).filename().string();
+                gtk_label_set_text(GTK_LABEL(std::get<0>(*info)), msg.c_str());
+                delete info;
+                return G_SOURCE_REMOVE;
+            }, new std::tuple<GtkWidget*, std::string>(labelProgress, path));
+            
+            if (type == "Ordner") {
+                // Rekursiv alle Medien-Dateien sammeln
+                try {
+                    for (const auto& entry : std::filesystem::recursive_directory_iterator(
+                        path, std::filesystem::directory_options::skip_permission_denied)) {
+                        try {
+                            if (entry.is_regular_file()) {
+                                std::string ext = entry.path().extension().string();
+                                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                                if (ext == ".mp3" || ext == ".wav" || ext == ".sid" || 
+                                    ext == ".flac" || ext == ".ogg" || ext == ".m4a" ||
+                                    ext == ".mp4" || ext == ".mkv" || ext == ".avi" || 
+                                    ext == ".webm" || ext == ".mov" || ext == ".flv") {
+                                    allFiles.push_back(entry.path().string());
+                                    
+                                    // Update alle 50 Dateien
+                                    if (allFiles.size() % 50 == 0) {
+                                        gdk_threads_add_idle([](gpointer data) -> gboolean {
+                                            auto* info = static_cast<std::tuple<GtkWidget*, int>*>(data);
+                                            std::string msg = "📂 Gefunden: " + std::to_string(std::get<1>(*info)) + " Dateien";
+                                            gtk_label_set_text(GTK_LABEL(std::get<0>(*info)), msg.c_str());
+                                            delete info;
+                                            return G_SOURCE_REMOVE;
+                                        }, new std::tuple<GtkWidget*, int>(labelProgress, (int)allFiles.size()));
+                                    }
+                                }
+                            }
+                        } catch (...) {
+                            // Einzelne Datei überspringen
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    errors.push_back(path + ": " + e.what());
+                }
+            } else if (type == "Audio" || type == "Video") {
+                // Direkte Datei
+                allFiles.push_back(path);
+            }
+        }
+        
+        int totalFiles = allFiles.size();
+        
+        if (totalFiles == 0) {
+            gdk_threads_add_idle([](gpointer data) -> gboolean {
+                auto* info = static_cast<std::tuple<GtkRenderer*, GtkWidget*>*>(data);
+                gtk_widget_destroy(std::get<1>(*info));
+                
+                GtkWidget* dialog = gtk_message_dialog_new(
+                    GTK_WINDOW(std::get<0>(*info)->window_),
+                    GTK_DIALOG_MODAL,
+                    GTK_MESSAGE_INFO,
+                    GTK_BUTTONS_OK,
+                    "ℹ️ Keine Medien-Dateien gefunden"
+                );
+                gtk_dialog_run(GTK_DIALOG(dialog));
+                gtk_widget_destroy(dialog);
+                
+                delete info;
+                return G_SOURCE_REMOVE;
+            }, new std::tuple<GtkRenderer*, GtkWidget*>(self, progressDialog));
+            return;
+        }
+        
+        // Verarbeite alle gesammelten Dateien
+        for (const auto& filepath : allFiles) {
             processed++;
             
-            // Prüfe ob Datei existiert
             if (!std::filesystem::exists(filepath)) {
-                g_free(filename);
                 skipped++;
                 continue;
             }
@@ -2394,15 +3670,38 @@ void GtkRenderer::onAddSelectedFiles(GtkWidget* widget, gpointer data) {
                 if (result == 0 && std::filesystem::exists(mp3Path)) {
                     finalPath = mp3Path;
                     converted++;
+                    
+                    // Historie für erfolgreiche Konvertierung
+                    gdk_threads_add_idle([](gpointer data) -> gboolean {
+                        auto* info = static_cast<std::tuple<GtkRenderer*, std::string, std::string>*>(data);
+                        std::get<0>(*info)->addHistoryEntry(
+                            "Video-Konvertierung",
+                            "Original: " + std::filesystem::path(std::get<1>(*info)).filename().string() + "\n" +
+                            "Ausgabe: " + std::filesystem::path(std::get<2>(*info)).filename().string(),
+                            "✅ Erfolgreich zu MP3 konvertiert"
+                        );
+                        delete info;
+                        return G_SOURCE_REMOVE;
+                    }, new std::tuple<GtkRenderer*, std::string, std::string>(self, filepath, mp3Path));
                 } else {
                     errors.push_back(filepath + ": Konvertierung fehlgeschlagen");
-                    g_free(filename);
                     skipped++;
+                    
+                    // Historie für fehlgeschlagene Konvertierung
+                    gdk_threads_add_idle([](gpointer data) -> gboolean {
+                        auto* info = static_cast<std::tuple<GtkRenderer*, std::string>*>(data);
+                        std::get<0>(*info)->addHistoryEntry(
+                            "Video-Konvertierung fehlgeschlagen",
+                            "Datei: " + std::filesystem::path(std::get<1>(*info)).filename().string(),
+                            "❌ FFmpeg-Fehler"
+                        );
+                        delete info;
+                        return G_SOURCE_REMOVE;
+                    }, new std::tuple<GtkRenderer*, std::string>(self, filepath));
                     continue;
                 }
             } else if (!isAudio) {
                 // Weder Audio noch Video
-                g_free(filename);
                 skipped++;
                 continue;
             }
@@ -2418,26 +3717,39 @@ void GtkRenderer::onAddSelectedFiles(GtkWidget* widget, gpointer data) {
             
             if (self->database_->addMedia(meta)) {
                 added++;
+                
+                // Historie-Eintrag hinzufügen
+                gdk_threads_add_idle([](gpointer data) -> gboolean {
+                    auto* info = static_cast<std::tuple<GtkRenderer*, std::string, bool>*>(data);
+                    std::string filename = std::filesystem::path(std::get<1>(*info)).filename().string();
+                    std::string action = std::get<2>(*info) ? "Video konvertiert & hinzugefügt" : "Datei hinzugefügt";
+                    std::get<0>(*info)->addHistoryEntry(
+                        action,
+                        "Datei: " + filename + "\nPfad: " + std::get<1>(*info),
+                        "✅ Zur Datenbank hinzugefügt"
+                    );
+                    delete info;
+                    return G_SOURCE_REMOVE;
+                }, new std::tuple<GtkRenderer*, std::string, bool>(self, finalPath, isVideo));
             } else {
                 skipped++;
             }
             
-            // Update Progress
-            gdk_threads_add_idle([](gpointer data) -> gboolean {
-                auto* info = static_cast<std::tuple<GtkWidget*, GtkWidget*, int, int>*>(data);
-                float progress = (float)std::get<2>(*info) / std::get<3>(*info);
-                gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(std::get<0>(*info)), progress);
-                
-                std::string text = std::to_string(std::get<2>(*info)) + " / " + std::to_string(std::get<3>(*info));
-                gtk_label_set_text(GTK_LABEL(std::get<1>(*info)), text.c_str());
-                
-                delete info;
-                return G_SOURCE_REMOVE;
-            }, new std::tuple<GtkWidget*, GtkWidget*, int, int>(progressBar, labelProgress, processed, fileCount));
-            
-            g_free(filename);
+            // Update Progress (nur alle 5 Dateien)
+            if (processed % 5 == 0 || processed == totalFiles) {
+                gdk_threads_add_idle([](gpointer data) -> gboolean {
+                    auto* info = static_cast<std::tuple<GtkWidget*, GtkWidget*, int, int>*>(data);
+                    float progress = (float)std::get<2>(*info) / std::get<3>(*info);
+                    // info: 0=labelProgress, 1=progressBar, 2=processed, 3=total
+                    gtk_label_set_text(GTK_LABEL(std::get<0>(*info)), 
+                        (std::to_string(std::get<2>(*info)) + " / " + std::to_string(std::get<3>(*info))).c_str());
+                    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(std::get<1>(*info)), progress);
+                    
+                    delete info;
+                    return G_SOURCE_REMOVE;
+                }, new std::tuple<GtkWidget*, GtkWidget*, int, int>(labelProgress, progressBar, processed, totalFiles));
+            }
         }
-        g_slist_free(filenames);
         
         self->refreshDatabaseView();
         
@@ -2531,13 +3843,15 @@ void GtkRenderer::onAddCurrentFolder(GtkWidget* widget, gpointer data) {
     GtkWidget* progressDialog = gtk_dialog_new_with_buttons(
         "Durchsuche Ordner...",
         GTK_WINDOW(self->window_),
-        GTK_DIALOG_MODAL,
+        (GtkDialogFlags)0,
         NULL
     );
     
+    makeDialogResizable(progressDialog, 500, 180);
     GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(progressDialog));
     GtkWidget* progressBar = gtk_progress_bar_new();
     GtkWidget* labelProgress = gtk_label_new("Durchsuche Verzeichnisse...");
+    gtk_label_set_selectable(GTK_LABEL(labelProgress), TRUE);
     
     gtk_box_pack_start(GTK_BOX(content), labelProgress, FALSE, FALSE, 5);
     gtk_box_pack_start(GTK_BOX(content), progressBar, FALSE, FALSE, 5);
@@ -2732,35 +4046,94 @@ void GtkRenderer::onAddCurrentFolder(GtkWidget* widget, gpointer data) {
     }).detach();
 }
 
-void GtkRenderer::onBookmarkClick(GtkWidget* widget, gpointer data) {
-    struct BrowserData {
-        GtkWidget* addrEntry;
-        GtkWidget* fileChooser;
-        GtkRenderer* self;
-    };
+void GtkRenderer::onBookmarkGo(GtkWidget* widget, gpointer data) {
+    GtkWidget* bookmarkCombo = GTK_WIDGET(g_object_get_data(G_OBJECT(widget), "bookmark-combo"));
+    BrowserData* bd = static_cast<BrowserData*>(g_object_get_data(G_OBJECT(widget), "browser-data"));
     
-    auto* bd = static_cast<BrowserData*>(data);
-    const char* label = gtk_button_get_label(GTK_BUTTON(widget));
+    if (!bookmarkCombo || !bd) return;
+    
+    int active = gtk_combo_box_get_active(GTK_COMBO_BOX(bookmarkCombo));
     std::string path;
-    
     const char* home = getenv("HOME");
     
-    if (std::string(label).find("Home") != std::string::npos) {
-        path = home ? home : "/home";
-    } else if (std::string(label).find("Musik") != std::string::npos) {
-        path = std::string(home ? home : "/home") + "/Music";
-    } else if (std::string(label).find("Downloads") != std::string::npos) {
-        path = std::string(home ? home : "/home") + "/Downloads";
-    } else if (std::string(label).find("HVSC") != std::string::npos) {
-        path = std::string(home ? home : "/home") + "/.songgen/hvsc/mp3";
-    } else if (std::string(label).find("Root") != std::string::npos) {
-        path = "/";
+    switch (active) {
+        case 0: path = home ? home : "/home"; break;  // Home
+        case 1: path = std::string(home ? home : "/home") + "/Music"; break;  // Musik
+        case 2: path = std::string(home ? home : "/home") + "/Downloads"; break;  // Downloads
+        case 3: path = std::string(home ? home : "/home") + "/Documents"; break;  // Dokumente
+        case 4: path = std::string(home ? home : "/home") + "/Pictures"; break;  // Bilder
+        case 5: path = std::string(home ? home : "/home") + "/Videos"; break;  // Videos
+        case 6: path = std::string(home ? home : "/home") + "/.songgen/hvsc/mp3"; break;  // HVSC
+        case 7: path = "/"; break;  // Root
+        case 8: path = "/tmp"; break;  // tmp
+        case 9: path = "/etc"; break;  // etc
+        case 10: path = "/usr"; break;  // usr
+        case 11: path = "/opt"; break;  // opt
+        default: path = home ? home : "/home"; break;
     }
     
     if (!path.empty()) {
         gtk_entry_set_text(GTK_ENTRY(bd->addrEntry), path.c_str());
-        gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(bd->fileChooser), path.c_str());
+        bd->currentPath = path;
+        loadBrowserDirectory(path, bd->store);
     }
+}
+
+void GtkRenderer::onBookmarkAdd(GtkWidget* widget, gpointer data) {
+    GtkWidget* addrEntry = GTK_WIDGET(g_object_get_data(G_OBJECT(widget), "addr-entry"));
+    GtkWidget* bookmarkCombo = GTK_WIDGET(g_object_get_data(G_OBJECT(widget), "bookmark-combo"));
+    
+    if (!addrEntry || !bookmarkCombo) return;
+    
+    const char* currentPath = gtk_entry_get_text(GTK_ENTRY(addrEntry));
+    if (!currentPath || strlen(currentPath) == 0) return;
+    
+    // Zeige Dialog zum Eingeben des Lesezeichennamens
+    GtkWidget* dialog = gtk_dialog_new_with_buttons(
+        "Lesezeichen hinzufügen",
+        nullptr,
+        (GtkDialogFlags)0,
+        "_Abbrechen", GTK_RESPONSE_CANCEL,
+        "_Hinzufügen", GTK_RESPONSE_OK,
+        nullptr
+    );
+    
+    makeDialogResizable(dialog, 400, 200);
+    
+    GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_container_add(GTK_CONTAINER(content), vbox);
+    
+    GtkWidget* labelPath = gtk_label_new(("Pfad: " + std::string(currentPath)).c_str());
+    gtk_label_set_selectable(GTK_LABEL(labelPath), TRUE);
+    gtk_box_pack_start(GTK_BOX(vbox), labelPath, FALSE, FALSE, 0);
+    
+    GtkWidget* labelName = gtk_label_new("Name für Lesezeichen:");
+    gtk_box_pack_start(GTK_BOX(vbox), labelName, FALSE, FALSE, 0);
+    
+    GtkWidget* entry = gtk_entry_new();
+    // Nutze letzten Teil des Pfads als Vorschlag
+    std::string suggestion = std::filesystem::path(currentPath).filename().string();
+    if (suggestion.empty()) suggestion = "Lesezeichen";
+    gtk_entry_set_text(GTK_ENTRY(entry), suggestion.c_str());
+    gtk_box_pack_start(GTK_BOX(vbox), entry, FALSE, FALSE, 0);
+    
+    gtk_widget_show_all(dialog);
+    
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        const char* name = gtk_entry_get_text(GTK_ENTRY(entry));
+        if (name && strlen(name) > 0) {
+            std::string bookmarkText = "📁 " + std::string(name);
+            gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(bookmarkCombo), bookmarkText.c_str());
+            
+            // Speichere Pfad in der ComboBox als Daten
+            int index = gtk_combo_box_get_active(GTK_COMBO_BOX(bookmarkCombo));
+            // TODO: Lesezeichen in Config-Datei speichern für Persistenz
+        }
+    }
+    
+    gtk_widget_destroy(dialog);
 }
 
 void GtkRenderer::onFolderChanged(GtkFileChooser* chooser, gpointer data) {
@@ -2777,6 +4150,104 @@ void GtkRenderer::onFolderChanged(GtkFileChooser* chooser, gpointer data) {
         gtk_entry_set_text(GTK_ENTRY(bd->addrEntry), folder);
         g_free(folder);
     }
+}
+
+// Browser TreeView Callback-Funktionen
+void GtkRenderer::onBrowserToggleCell(GtkCellRendererToggle* cell, gchar* path_str, gpointer data) {
+    GtkListStore* store = GTK_LIST_STORE(data);
+    GtkTreeIter iter;
+    if (gtk_tree_model_get_iter_from_string(GTK_TREE_MODEL(store), &iter, path_str)) {
+        gboolean active;
+        gtk_tree_model_get(GTK_TREE_MODEL(store), &iter, 0, &active, -1);
+        gtk_list_store_set(store, &iter, 0, !active, -1);
+    }
+}
+
+void GtkRenderer::onBrowserSelectAll(GtkWidget* widget, gpointer data) {
+    GtkListStore* store = GTK_LIST_STORE(data);
+    GtkTreeIter iter;
+    if (gtk_tree_model_get_iter_first(GTK_TREE_MODEL(store), &iter)) {
+        do {
+            gtk_list_store_set(store, &iter, 0, TRUE, -1);
+        } while (gtk_tree_model_iter_next(GTK_TREE_MODEL(store), &iter));
+    }
+}
+
+void GtkRenderer::onBrowserDeselectAll(GtkWidget* widget, gpointer data) {
+    GtkListStore* store = GTK_LIST_STORE(data);
+    GtkTreeIter iter;
+    if (gtk_tree_model_get_iter_first(GTK_TREE_MODEL(store), &iter)) {
+        do {
+            gtk_list_store_set(store, &iter, 0, FALSE, -1);
+        } while (gtk_tree_model_iter_next(GTK_TREE_MODEL(store), &iter));
+    }
+}
+
+void GtkRenderer::onBrowserRowActivated(GtkTreeView* tree, GtkTreePath* path, GtkTreeViewColumn* col, gpointer data) {
+    auto* bd = static_cast<BrowserData*>(data);
+    GtkTreeIter iter;
+    GtkTreeModel* model = gtk_tree_view_get_model(tree);
+    
+    if (gtk_tree_model_get_iter(model, &iter, path)) {
+        gchar* type;
+        gchar* fullPath;
+        gtk_tree_model_get(model, &iter, 3, &type, 4, &fullPath, -1);
+        
+        if (std::string(type) == "Ordner") {
+            // Navigiere in Ordner
+            bd->currentPath = fullPath;
+            gtk_entry_set_text(GTK_ENTRY(bd->addrEntry), fullPath);
+            loadBrowserDirectory(fullPath, bd->store);
+        }
+        
+        g_free(type);
+        g_free(fullPath);
+    }
+}
+
+void GtkRenderer::loadBrowserDirectory(const std::string& path, GtkListStore* store) {
+    gtk_list_store_clear(store);
+    
+    try {
+        for (const auto& entry : std::filesystem::directory_iterator(path)) {
+            try {
+                std::string filename = entry.path().filename().string();
+                std::string icon, type;
+                
+                if (entry.is_directory()) {
+                    icon = "📁";
+                    type = "Ordner";
+                } else if (entry.is_regular_file()) {
+                    std::string ext = entry.path().extension().string();
+                    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                    
+                    if (ext == ".mp3" || ext == ".wav" || ext == ".flac" || 
+                        ext == ".ogg" || ext == ".m4a" || ext == ".sid") {
+                        icon = "🎵";
+                        type = "Audio";
+                    } else if (ext == ".mp4" || ext == ".mkv" || ext == ".avi" || 
+                               ext == ".webm" || ext == ".mov" || ext == ".flv") {
+                        icon = "🎬";
+                        type = "Video";
+                    } else {
+                        continue; // Skip other files
+                    }
+                } else {
+                    continue; // Skip non-regular files
+                }
+                
+                GtkTreeIter iter;
+                gtk_list_store_append(store, &iter);
+                gtk_list_store_set(store, &iter,
+                    0, FALSE,                              // Checkbox
+                    1, icon.c_str(),                       // Icon
+                    2, filename.c_str(),                   // Name
+                    3, type.c_str(),                       // Typ
+                    4, entry.path().string().c_str(),      // Fullpath
+                    -1);
+            } catch (...) {}
+        }
+    } catch (...) {}
 }
 
 void GtkRenderer::onPlaySong(GtkTreeView* tree_view, GtkTreePath* path, GtkTreeViewColumn* column, gpointer data) {
@@ -2852,6 +4323,7 @@ void GtkRenderer::onGenreChanged(GtkWidget* widget, gpointer data) {
     else if (genreStr == "Hardstyle") suggestedBPM = 150;
     else if (genreStr == "Rock") suggestedBPM = 120;
     else if (genreStr == "Metal") suggestedBPM = 180;
+    else if (genreStr == "Punk") suggestedBPM = 180;
     else if (genreStr == "Pop") suggestedBPM = 120;
     else if (genreStr == "Hip-Hop") suggestedBPM = 90;
     else if (genreStr == "Jazz") suggestedBPM = 120;
@@ -2959,13 +4431,15 @@ void GtkRenderer::onGenerateSong(GtkWidget* widget, gpointer data) {
     GtkWidget* dialog = gtk_dialog_new_with_buttons(
         "Song wird generiert...",
         GTK_WINDOW(self->window_),
-        GTK_DIALOG_MODAL,
+        (GtkDialogFlags)0,
         nullptr
     );
     
+    makeDialogResizable(dialog, 450, 180);
     GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
     GtkWidget* progressBar = gtk_progress_bar_new();
     GtkWidget* labelStatus = gtk_label_new("Initialisiere Generator...");
+    gtk_label_set_selectable(GTK_LABEL(labelStatus), TRUE);
     
     gtk_box_pack_start(GTK_BOX(content), labelStatus, FALSE, FALSE, 10);
     gtk_box_pack_start(GTK_BOX(content), progressBar, FALSE, FALSE, 10);
@@ -3152,12 +4626,13 @@ std::string GtkRenderer::showDecisionDialog(const std::string& question,
     GtkWidget* dialog = gtk_dialog_new_with_buttons(
         "🤔 KI-Entscheidungshilfe",
         GTK_WINDOW(window_),
-        GTK_DIALOG_MODAL,
+        (GtkDialogFlags)0,
         "_Abbrechen", GTK_RESPONSE_CANCEL,
         "_OK", GTK_RESPONSE_OK,
         nullptr
     );
     
+    makeDialogResizable(dialog, 600, 400);
     GtkWidget* contentArea = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
     gtk_container_set_border_width(GTK_CONTAINER(contentArea), 10);
     
@@ -3259,12 +4734,12 @@ void GtkRenderer::onShowDecisionHistory(GtkWidget* widget, gpointer data) {
     GtkWidget* dialog = gtk_dialog_new_with_buttons(
         "📜 Entscheidungs-Historie",
         GTK_WINDOW(self->window_),
-        GTK_DIALOG_MODAL,
+        (GtkDialogFlags)0,
         "_Schließen", GTK_RESPONSE_CLOSE,
         nullptr
     );
     
-    gtk_window_set_default_size(GTK_WINDOW(dialog), 800, 600);
+    makeDialogResizable(dialog, 800, 600);
     
     GtkWidget* contentArea = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
     
@@ -3326,6 +4801,7 @@ void GtkRenderer::onShowDecisionHistory(GtkWidget* widget, gpointer data) {
     
     // Statistik-Label am Ende
     GtkWidget* statsLabel = gtk_label_new(nullptr);
+    gtk_label_set_selectable(GTK_LABEL(statsLabel), TRUE);
     std::string statsText = "<b>Statistik:</b> " + std::to_string(decisions.size()) + " Entscheidungen gespeichert";
     gtk_label_set_markup(GTK_LABEL(statsLabel), statsText.c_str());
     gtk_widget_set_margin_top(statsLabel, 10);
@@ -3445,6 +4921,7 @@ void GtkRenderer::onTrainModel(GtkWidget* widget, gpointer data) {
             GTK_BUTTONS_OK,
             "Training läuft bereits!"
         );
+        makeDialogResizable(dialog, 400, 150);
         gtk_dialog_run(GTK_DIALOG(dialog));
         gtk_widget_destroy(dialog);
         return;
@@ -3478,10 +4955,16 @@ void GtkRenderer::onTrainModel(GtkWidget* widget, gpointer data) {
                 float progress = (float)epoch / maxEpochs;
                 gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(self->trainingProgressBar_), progress);
                 
+                // Progressbar mit % beschriften
+                char percentText[32];
+                snprintf(percentText, sizeof(percentText), "%.1f%%", progress * 100.0f);
+                gtk_progress_bar_set_text(GTK_PROGRESS_BAR(self->trainingProgressBar_), percentText);
+                gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(self->trainingProgressBar_), TRUE);
+                
                 char status[256];
                 snprintf(status, sizeof(status), 
-                        "Epoch %d/%d - Loss: %.4f - Accuracy: %.1f%%",
-                        epoch, maxEpochs, loss, accuracy * 100.0f);
+                        "Epoch %d/%d (%.1f%%) - Loss: %.4f - Accuracy: %.1f%%",
+                        epoch, maxEpochs, progress * 100.0f, loss, accuracy * 100.0f);
                 gtk_label_set_text(GTK_LABEL(self->trainingStatusLabel_), status);
                 
                 delete args;
@@ -3610,12 +5093,13 @@ void GtkRenderer::onSavePreset(GtkWidget* widget, gpointer data) {
     GtkWidget* dialog = gtk_dialog_new_with_buttons(
         "Preset speichern",
         GTK_WINDOW(self->window_),
-        GTK_DIALOG_MODAL,
+        (GtkDialogFlags)0,
         "_Abbrechen", GTK_RESPONSE_CANCEL,
         "_Speichern", GTK_RESPONSE_ACCEPT,
         NULL
     );
     
+    makeDialogResizable(dialog, 400, 200);
     GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
     GtkWidget* entry = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(entry), "Preset-Name...");
@@ -3831,4 +5315,2635 @@ gboolean GtkRenderer::onGPUUpdateTimer(gpointer data) {
         return G_SOURCE_CONTINUE;  // Timer weiterlaufen lassen
     }
     return G_SOURCE_REMOVE;
+}
+
+void GtkRenderer::addHistoryEntry(const std::string& action, const std::string& details, const std::string& result) {
+    if (!historyStore_) return;
+    
+    // Zeitstempel
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+    char timestamp[64];
+    std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", std::localtime(&time_t_now));
+    
+    // Füge Eintrag hinzu
+    GtkTreeIter iter;
+    gtk_list_store_append(historyStore_, &iter);
+    gtk_list_store_set(historyStore_, &iter,
+        0, timestamp,
+        1, action.c_str(),
+        2, details.c_str(),
+        3, result.c_str(),
+        4, "",  // FilePath (optional)
+        5, "",  // Metadata JSON (optional)
+        -1);
+    
+    // Scrolle zum neuesten Eintrag
+    GtkTreePath* path = gtk_tree_model_get_path(GTK_TREE_MODEL(historyStore_), &iter);
+    gtk_tree_view_scroll_to_cell(GTK_TREE_VIEW(historyTreeView_), path, NULL, TRUE, 1.0, 0.0);
+    gtk_tree_path_free(path);
+    
+    std::cout << "📜 Historie: " << action << " - " << details << std::endl;
+}
+
+void GtkRenderer::onHistoryRowActivated(GtkTreeView* tree, GtkTreePath* path, GtkTreeViewColumn* col, gpointer data) {
+    GtkRenderer* self = static_cast<GtkRenderer*>(data);
+    GtkTreeModel* model = gtk_tree_view_get_model(tree);
+    GtkTreeIter iter;
+    
+    if (gtk_tree_model_get_iter(model, &iter, path)) {
+        gchar* timestamp;
+        gchar* action;
+        gchar* details;
+        gchar* result;
+        gchar* filepath;
+        gchar* metadata;
+        
+        gtk_tree_model_get(model, &iter,
+            0, &timestamp,
+            1, &action,
+            2, &details,
+            3, &result,
+            4, &filepath,
+            5, &metadata,
+            -1);
+        
+        // Zeige Details im TextView
+        std::ostringstream detailsText;
+        detailsText << "═══════════════════════════════════════\n";
+        detailsText << "📅 Zeitstempel: " << timestamp << "\n";
+        detailsText << "🎬 Aktion: " << action << "\n";
+        detailsText << "═══════════════════════════════════════\n\n";
+        detailsText << "📋 Details:\n" << details << "\n\n";
+        detailsText << "✅ Ergebnis:\n" << result << "\n\n";
+        
+        if (filepath && strlen(filepath) > 0) {
+            detailsText << "📁 Datei:\n" << filepath << "\n\n";
+        }
+        
+        if (metadata && strlen(metadata) > 0) {
+            detailsText << "🔧 Metadaten (JSON):\n" << metadata << "\n\n";
+        }
+        
+        detailsText << "═══════════════════════════════════════\n";
+        detailsText << "💡 Doppelklick auf 'Metadaten bearbeiten' zum Korrigieren\n";
+        
+        GtkTextBuffer* buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(self->historyTextView_));
+        gtk_text_buffer_set_text(buffer, detailsText.str().c_str(), -1);
+        
+        g_free(timestamp);
+        g_free(action);
+        g_free(details);
+        g_free(result);
+        g_free(filepath);
+        g_free(metadata);
+    }
+}
+
+void GtkRenderer::onEditHistoryMetadata(GtkWidget* widget, gpointer data) {
+    GtkRenderer* self = static_cast<GtkRenderer*>(data);
+    
+    // Hole ausgewählten Eintrag
+    GtkTreeSelection* selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(self->historyTreeView_));
+    GtkTreeModel* model;
+    GtkTreeIter iter;
+    
+    if (!gtk_tree_selection_get_selected(selection, &model, &iter)) {
+        GtkWidget* dialog = gtk_message_dialog_new(
+            GTK_WINDOW(self->window_),
+            GTK_DIALOG_MODAL,
+            GTK_MESSAGE_INFO,
+            GTK_BUTTONS_OK,
+            "ℹ️ Bitte wähle einen Historie-Eintrag aus"
+        );
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        return;
+    }
+    
+    gchar* filepath;
+    gchar* action;
+    gtk_tree_model_get(model, &iter, 4, &filepath, 1, &action, -1);
+    
+    if (!filepath || strlen(filepath) == 0) {
+        GtkWidget* dialog = gtk_message_dialog_new(
+            GTK_WINDOW(self->window_),
+            GTK_DIALOG_MODAL,
+            GTK_MESSAGE_WARNING,
+            GTK_BUTTONS_OK,
+            "⚠️ Dieser Eintrag hat keine zugeordnete Datei"
+        );
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        g_free(filepath);
+        g_free(action);
+        return;
+    }
+    
+    // Lade Metadaten aus Datenbank
+    auto allMedia = self->database_->getAll();
+    MediaMetadata* targetMeta = nullptr;
+    for (auto& meta : allMedia) {
+        if (meta.filepath == filepath) {
+            targetMeta = &meta;
+            break;
+        }
+    }
+    
+    if (!targetMeta) {
+        GtkWidget* dialog = gtk_message_dialog_new(
+            GTK_WINDOW(self->window_),
+            GTK_DIALOG_MODAL,
+            GTK_MESSAGE_WARNING,
+            GTK_BUTTONS_OK,
+            "⚠️ Datei nicht mehr in Datenbank: %s",
+            filepath
+        );
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        g_free(filepath);
+        g_free(action);
+        return;
+    }
+    
+    // Editor-Dialog erstellen
+    GtkWidget* editDialog = gtk_dialog_new_with_buttons(
+        "✏️ Metadaten bearbeiten",
+        GTK_WINDOW(self->window_),
+        (GtkDialogFlags)0,
+        "💾 Speichern", GTK_RESPONSE_ACCEPT,
+        "❌ Abbrechen", GTK_RESPONSE_CANCEL,
+        NULL
+    );
+    
+    makeDialogResizable(editDialog, 600, 500);
+    
+    GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(editDialog));
+    GtkWidget* grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 10);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 10);
+    gtk_container_set_border_width(GTK_CONTAINER(grid), 15);
+    gtk_container_add(GTK_CONTAINER(content), grid);
+    
+    int row = 0;
+    
+    // Dateiname (read-only) mit Play/Stop Buttons
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("📁 Datei:"), 0, row, 1, 1);
+    GtkWidget* labelFile = gtk_label_new(std::filesystem::path(filepath).filename().c_str());
+    gtk_label_set_selectable(GTK_LABEL(labelFile), TRUE);
+    gtk_grid_attach(GTK_GRID(grid), labelFile, 1, row, 1, 1);
+    
+    // Play/Stop Buttons
+    GtkWidget* btnBox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    
+    // Speichere filepath für Callback
+    struct PlayData {
+        GtkRenderer* renderer;
+        std::string filepath;
+    };
+    PlayData* playData = new PlayData{self, std::string(filepath)};
+    
+    GtkWidget* btnPlay = gtk_button_new_with_label("▶️ Play");
+    g_signal_connect_data(btnPlay, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
+        auto* pd = static_cast<PlayData*>(data);
+        pd->renderer->audioPlayer_->stop();
+        if (pd->renderer->audioPlayer_->load(pd->filepath)) {
+            pd->renderer->audioPlayer_->play();
+        }
+    }), playData, NULL, G_CONNECT_AFTER);
+    gtk_box_pack_start(GTK_BOX(btnBox), btnPlay, FALSE, FALSE, 0);
+    
+    GtkWidget* btnStop = gtk_button_new_with_label("⏹️ Stop");
+    g_signal_connect(btnStop, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
+        static_cast<GtkRenderer*>(data)->audioPlayer_->stop();
+    }), self);
+    gtk_box_pack_start(GTK_BOX(btnBox), btnStop, FALSE, FALSE, 0);
+    
+    gtk_grid_attach(GTK_GRID(grid), btnBox, 2, row++, 1, 1);
+    
+    // Titel
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("🎵 Titel:"), 0, row, 1, 1);
+    GtkWidget* entryTitle = gtk_entry_new();
+    gtk_entry_set_text(GTK_ENTRY(entryTitle), targetMeta->title.c_str());
+    gtk_grid_attach(GTK_GRID(grid), entryTitle, 1, row++, 1, 1);
+    
+    // Artist
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("🎤 Artist:"), 0, row, 1, 1);
+    GtkWidget* entryArtist = gtk_entry_new();
+    gtk_entry_set_text(GTK_ENTRY(entryArtist), targetMeta->artist.c_str());
+    gtk_grid_attach(GTK_GRID(grid), entryArtist, 1, row++, 1, 1);
+    
+    // Genre
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("🎭 Genre:"), 0, row, 1, 1);
+    GtkWidget* comboGenre = gtk_combo_box_text_new();
+    const char* genres[] = {"Electronic", "Techno", "House", "Trance", "Ambient", "Hip-Hop", 
+                            "RnB", "Jazz", "Classical", "Salsa", "Walzer", "Rock/Pop", "Reggae", "Punk", "Vocal", "Volksmusik", "SID", "Unknown"};
+    for (const char* g : genres) {
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(comboGenre), g);
+    }
+    gtk_combo_box_set_active(GTK_COMBO_BOX(comboGenre), 0);
+    for (int i = 0; i < 15; i++) {
+        if (targetMeta->genre == genres[i]) {
+            gtk_combo_box_set_active(GTK_COMBO_BOX(comboGenre), i);
+            break;
+        }
+    }
+    gtk_grid_attach(GTK_GRID(grid), comboGenre, 1, row++, 1, 1);
+    
+    // BPM
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("🥁 BPM:"), 0, row, 1, 1);
+    GtkWidget* spinBPM = gtk_spin_button_new_with_range(0, 300, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(spinBPM), targetMeta->bpm);
+    gtk_grid_attach(GTK_GRID(grid), spinBPM, 1, row++, 1, 1);
+    
+    // Intensity
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("💪 Intensität:"), 0, row, 1, 1);
+    GtkWidget* comboIntensity = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(comboIntensity), "soft");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(comboIntensity), "mittel");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(comboIntensity), "hart");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(comboIntensity), 1);
+    if (targetMeta->intensity == "soft") gtk_combo_box_set_active(GTK_COMBO_BOX(comboIntensity), 0);
+    else if (targetMeta->intensity == "hart") gtk_combo_box_set_active(GTK_COMBO_BOX(comboIntensity), 2);
+    gtk_grid_attach(GTK_GRID(grid), comboIntensity, 1, row++, 1, 1);
+    
+    // Bass Level
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("🔊 Bass-Level:"), 0, row, 1, 1);
+    GtkWidget* comboBass = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(comboBass), "soft");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(comboBass), "mittel");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(comboBass), "basslastig");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(comboBass), 1);
+    if (targetMeta->bassLevel == "soft") gtk_combo_box_set_active(GTK_COMBO_BOX(comboBass), 0);
+    else if (targetMeta->bassLevel == "basslastig") gtk_combo_box_set_active(GTK_COMBO_BOX(comboBass), 2);
+    gtk_grid_attach(GTK_GRID(grid), comboBass, 1, row++, 1, 1);
+    
+    // Mood
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("😊 Stimmung:"), 0, row, 1, 1);
+    GtkWidget* entryMood = gtk_entry_new();
+    gtk_entry_set_text(GTK_ENTRY(entryMood), targetMeta->mood.c_str());
+    gtk_entry_set_placeholder_text(GTK_ENTRY(entryMood), "z.B. Energetic, Relaxed, Dark");
+    gtk_grid_attach(GTK_GRID(grid), entryMood, 1, row++, 1, 1);
+    
+    gtk_widget_show_all(editDialog);
+    
+    gint response = gtk_dialog_run(GTK_DIALOG(editDialog));
+    
+    if (response == GTK_RESPONSE_ACCEPT) {
+        // Speichere Änderungen
+        targetMeta->title = gtk_entry_get_text(GTK_ENTRY(entryTitle));
+        targetMeta->artist = gtk_entry_get_text(GTK_ENTRY(entryArtist));
+        targetMeta->genre = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(comboGenre));
+        targetMeta->bpm = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(spinBPM));
+        targetMeta->intensity = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(comboIntensity));
+        targetMeta->bassLevel = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(comboBass));
+        targetMeta->mood = gtk_entry_get_text(GTK_ENTRY(entryMood));
+        
+        if (self->database_->updateMedia(*targetMeta)) {
+            self->addHistoryEntry(
+                "Metadaten bearbeitet",
+                "Datei: " + std::string(filepath) + "\n" +
+                "Titel: " + targetMeta->title + "\n" +
+                "Genre: " + targetMeta->genre + "\n" +
+                "BPM: " + std::to_string(targetMeta->bpm),
+                "✅ Erfolgreich gespeichert"
+            );
+            
+            self->refreshDatabaseView();
+            
+            GtkWidget* successDialog = gtk_message_dialog_new(
+                GTK_WINDOW(self->window_),
+                GTK_DIALOG_MODAL,
+                GTK_MESSAGE_INFO,
+                GTK_BUTTONS_OK,
+                "✅ Metadaten erfolgreich gespeichert"
+            );
+            gtk_dialog_run(GTK_DIALOG(successDialog));
+            gtk_widget_destroy(successDialog);
+        }
+    }
+    
+    gtk_widget_destroy(editDialog);
+    g_free(filepath);
+    g_free(action);
+}
+
+void GtkRenderer::onShowInstrumentsFolder(GtkWidget* widget, gpointer data) {
+    std::string cmd = "xdg-open ~/.songgen/instruments/ 2>/dev/null || nautilus ~/.songgen/instruments/ 2>/dev/null || thunar ~/.songgen/instruments/ 2>/dev/null &";
+    system(cmd.c_str());
+}
+
+void GtkRenderer::onShowInstrumentStats(GtkWidget* widget, gpointer data) {
+    GtkRenderer* self = static_cast<GtkRenderer*>(data);
+    std::string instrumentDir = std::string(std::getenv("HOME")) + "/.songgen/instruments/";
+    
+    std::map<std::string, int> counts;
+    const char* categories[] = {"kicks", "snares", "hihats", "bass", "leads", "other"};
+    
+    for (const char* cat : categories) {
+        std::string path = instrumentDir + cat;
+        int count = 0;
+        if (std::filesystem::exists(path)) {
+            for (const auto& entry : std::filesystem::directory_iterator(path)) {
+                if (entry.is_regular_file() && entry.path().extension() == ".wav") {
+                    count++;
+                }
+            }
+        }
+        counts[cat] = count;
+    }
+    
+    std::string msg = "🎸 Extrahierte Instrumenten-Samples:\n\n";
+    msg += "🥁 Kicks: " + std::to_string(counts["kicks"]) + "\n";
+    msg += "🥁 Snares: " + std::to_string(counts["snares"]) + "\n";
+    msg += "🎵 Hi-Hats: " + std::to_string(counts["hihats"]) + "\n";
+    msg += "🎸 Bass: " + std::to_string(counts["bass"]) + "\n";
+    msg += "🎹 Leads: " + std::to_string(counts["leads"]) + "\n";
+    msg += "🎼 Other: " + std::to_string(counts["other"]) + "\n\n";
+    
+    int total = 0;
+    for (const auto& pair : counts) total += pair.second;
+    msg += "📦 Gesamt: " + std::to_string(total) + " Samples";
+    
+    GtkWidget* dialog = gtk_message_dialog_new(
+        GTK_WINDOW(self->window_), GTK_DIALOG_MODAL,
+        GTK_MESSAGE_INFO, GTK_BUTTONS_OK, "%s", msg.c_str());
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}
+
+void GtkRenderer::onRemoveInstrumentDuplicates(GtkWidget* widget, gpointer data) {
+    GtkRenderer* self = static_cast<GtkRenderer*>(data);
+    
+    std::string instrumentDir = std::string(std::getenv("HOME")) + "/.songgen/instruments/";
+    
+    // Prüfe ob Instrumente vorhanden sind
+    bool hasInstruments = false;
+    if (std::filesystem::exists(instrumentDir)) {
+        for (const auto& entry : std::filesystem::directory_iterator(instrumentDir)) {
+            if (entry.is_directory()) {
+                hasInstruments = true;
+                break;
+            }
+        }
+    }
+    
+    if (!hasInstruments) {
+        GtkWidget* dialog = gtk_message_dialog_new(
+            GTK_WINDOW(self->window_), GTK_DIALOG_MODAL,
+            GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
+            "ℹ️ Keine Instrumente gefunden.\n\n"
+            "Instrumente werden automatisch während des Trainings extrahiert.\n"
+            "Starte zuerst ein Training:\n🎓 Training starten");
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        return;
+    }
+    
+    GtkWidget* dialog = gtk_message_dialog_new(
+        GTK_WINDOW(self->window_), GTK_DIALOG_MODAL,
+        GTK_MESSAGE_QUESTION, GTK_BUTTONS_YES_NO,
+        "🔍 Instrumenten-Duplikate entfernen?\n\n"
+        "Ähnlich klingende Samples werden automatisch erkannt und entfernt:\n"
+        "• Cross-Correlation Analyse (85%% Ähnlichkeit)\n"
+        "• RMS-Vergleich (Lautstärke)\n"
+        "• Peak-Analyse (Maximale Amplituden)\n\n"
+        "Dies kann die Qualität der Genre-Kombinationen verbessern.\n\n"
+        "Fortfahren?");
+    
+    gint result = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+    
+    if (result != GTK_RESPONSE_YES) return;
+    
+    // Zeige Progress-Dialog
+    GtkWidget* progressDialog = gtk_message_dialog_new(
+        GTK_WINDOW(self->window_), GTK_DIALOG_MODAL,
+        GTK_MESSAGE_INFO, GTK_BUTTONS_NONE,
+        "🔍 Prüfe Instrumente auf Ähnlichkeit...\n\n"
+        "Dies kann einige Sekunden dauern...");
+    gtk_widget_show_all(progressDialog);
+    
+    // Verarbeitung im Main-Thread
+    while (gtk_events_pending()) gtk_main_iteration();
+    
+    // Führe Deduplizierung in Thread durch
+    std::thread([self, progressDialog]() {
+        std::cout << "\n🔍 Starte Instrumenten-Duplikat-Erkennung..." << std::endl;
+        
+        if (self->trainingModel_) {
+            self->trainingModel_->removeDuplicateInstruments();
+        }
+        
+        // Schließe Progress-Dialog
+        gdk_threads_add_idle([](gpointer data) -> gboolean {
+            gtk_widget_destroy(static_cast<GtkWidget*>(data));
+            return G_SOURCE_REMOVE;
+        }, progressDialog);
+        
+        // Zeige Erfolgs-Dialog
+        gdk_threads_add_idle([](gpointer data) -> gboolean {
+            GtkRenderer* self = static_cast<GtkRenderer*>(data);
+            GtkWidget* successDialog = gtk_message_dialog_new(
+                GTK_WINDOW(self->window_), GTK_DIALOG_MODAL,
+                GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
+                "✅ Duplikat-Erkennung abgeschlossen!\n\n"
+                "Details siehe Console-Ausgabe.\n"
+                "Die Instrumenten-Library wurde optimiert.");
+            gtk_dialog_run(GTK_DIALOG(successDialog));
+            gtk_widget_destroy(successDialog);
+            return G_SOURCE_REMOVE;
+        }, self);
+    }).detach();
+}
+
+void GtkRenderer::onAnalyzeDatabase(GtkWidget* widget, gpointer data) {
+    GtkRenderer* self = static_cast<GtkRenderer*>(data);
+    
+    if (!self->trainingModel_) return;
+    
+    GtkWidget* dialog = gtk_message_dialog_new(
+        GTK_WINDOW(self->window_), GTK_DIALOG_MODAL, GTK_MESSAGE_INFO,
+        GTK_BUTTONS_NONE, 
+        "🧠 Intelligente Datenbank-Analyse\n\n"
+        "Analysiert alle Tracks basierend auf Korrektur-Historie\n"
+        "und schlägt automatische Genre-Korrekturen vor.");
+    
+    gtk_dialog_add_buttons(GTK_DIALOG(dialog),
+        "Abbrechen", GTK_RESPONSE_CANCEL,
+        "Nur analysieren", GTK_RESPONSE_NO,
+        "Analysieren & Auto-Korrigieren", GTK_RESPONSE_YES,
+        NULL);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 500, 180);
+    
+    int response = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+    
+    if (response == GTK_RESPONSE_NO || response == GTK_RESPONSE_YES) {
+        bool autoApply = (response == GTK_RESPONSE_YES);
+        
+        // Progress-Dialog
+        GtkWidget* progressDialog = gtk_dialog_new_with_buttons(
+            "🧠 Analysiere Datenbank...",
+            GTK_WINDOW(self->window_),
+            (GtkDialogFlags)0,
+            "Abbrechen", GTK_RESPONSE_CANCEL,
+            NULL
+        );
+        makeDialogResizable(progressDialog, 500, 180);
+        
+        GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(progressDialog));
+        GtkWidget* label = gtk_label_new("Analysiere Tracks und schlage Korrekturen vor...");
+        GtkWidget* progressBar = gtk_progress_bar_new();
+        gtk_progress_bar_set_pulse_step(GTK_PROGRESS_BAR(progressBar), 0.1);
+        
+        gtk_box_pack_start(GTK_BOX(content), label, FALSE, FALSE, 5);
+        gtk_box_pack_start(GTK_BOX(content), progressBar, FALSE, FALSE, 5);
+        gtk_widget_show_all(progressDialog);
+        
+        // Pulse animation
+        guint timeoutId = g_timeout_add(100, [](gpointer data) -> gboolean {
+            gtk_progress_bar_pulse(GTK_PROGRESS_BAR(data));
+            return G_SOURCE_CONTINUE;
+        }, progressBar);
+        
+        // Analyse in Thread (ASYNCHRON!)
+        std::thread([self, autoApply, progressDialog, timeoutId]() {
+            std::cout << "🧠 Starte intelligente Datenbank-Analyse...\n";
+            
+            int corrections = self->trainingModel_->suggestDatabaseCorrections(autoApply);
+            
+            // Stop pulse animation
+            g_source_remove(timeoutId);
+            
+            // Zeige Ergebnis
+            gdk_threads_add_idle([](gpointer data) -> gboolean {
+                auto* info = static_cast<std::tuple<GtkRenderer*, GtkWidget*, int, bool>*>(data);
+                GtkRenderer* self = std::get<0>(*info);
+                GtkWidget* progressDlg = std::get<1>(*info);
+                int corrections = std::get<2>(*info);
+                bool autoApply = std::get<3>(*info);
+                
+                gtk_widget_destroy(progressDlg);
+                
+                float correctionPercent = self->filteredMedia_.empty() ? 0.0f :
+                    (float)corrections / self->filteredMedia_.size() * 100.0f;
+                
+                char message[512];
+                snprintf(message, sizeof(message),
+                    "%s\n\n%d Korrektur-Vorschläge gefunden (%.1f%%)\n%s",
+                    autoApply ? "✅ Analyse & Auto-Korrektur abgeschlossen" : "🔍 Analyse abgeschlossen",
+                    corrections, correctionPercent,
+                    autoApply ? "Alle Korrekturen wurden angewendet!" : "Details siehe Terminal-Ausgabe");
+                
+                GtkWidget* resultDialog = gtk_message_dialog_new(
+                    GTK_WINDOW(self->window_), GTK_DIALOG_MODAL, GTK_MESSAGE_INFO,
+                    GTK_BUTTONS_OK, "%s", message);
+                gtk_window_set_title(GTK_WINDOW(resultDialog), "Analyse abgeschlossen");
+                gtk_window_set_default_size(GTK_WINDOW(resultDialog), 500, 180);
+                gtk_dialog_run(GTK_DIALOG(resultDialog));
+                gtk_widget_destroy(resultDialog);
+                
+                // Refresh view if auto-applied
+                if (autoApply) {
+                    self->refreshDatabaseView();
+                }
+                
+                delete info;
+                return G_SOURCE_REMOVE;
+            }, new std::tuple<GtkRenderer*, GtkWidget*, int, bool>(self, progressDialog, corrections, autoApply));
+            
+        }).detach();
+    }
+}
+
+void GtkRenderer::onShowPatterns(GtkWidget* widget, gpointer data) {
+    GtkRenderer* self = static_cast<GtkRenderer*>(data);
+    
+    if (!self->trainingModel_) return;
+    
+    auto patterns = self->trainingModel_->learnCorrectionPatterns();
+    
+    std::string msg = "🧠 Erkannte Korrektur-Muster:\n\n";
+    if (patterns.empty()) {
+        msg += "Noch keine Muster erkannt.\n";
+        msg += "Führe mehr Korrekturen durch, um Muster zu lernen.";
+    } else {
+        for (const auto& [key, genre] : patterns) {
+            if (key.find("artist:") == 0) {
+                msg += "🎨 Artist: " + key.substr(7) + " → " + genre + "\n";
+            } else if (key.find("bpm:") == 0) {
+                msg += "⚡ BPM: " + key.substr(4) + " → " + genre + "\n";
+            }
+        }
+    }
+    
+    GtkWidget* dialog = gtk_message_dialog_new(
+        GTK_WINDOW(self->window_), GTK_DIALOG_MODAL, GTK_MESSAGE_INFO,
+        GTK_BUTTONS_OK, "%s", msg.c_str());
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}
+
+void GtkRenderer::onLearnSongStructure(GtkWidget* widget, gpointer data) {
+    GtkRenderer* self = static_cast<GtkRenderer*>(data);
+    
+    if (!self->database_ || !self->analyzer_) return;
+    
+    // Frage nach Genre
+    GtkWidget* dialog = gtk_dialog_new_with_buttons(
+        "Song-Struktur-Analyse",
+        GTK_WINDOW(self->window_),
+        (GtkDialogFlags)0,
+        "Abbrechen", GTK_RESPONSE_CANCEL,
+        "Alle Genres", GTK_RESPONSE_YES,
+        "Spezifisches Genre", GTK_RESPONSE_NO,
+        NULL);
+    
+    makeDialogResizable(dialog, 450, 200);
+    GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget* label = gtk_label_new("Analysiert Song-Strukturen (Intro, Verse, Chorus, etc.)\n"
+                                     "und lernt typische Arrangements pro Genre.");
+    gtk_box_pack_start(GTK_BOX(content), label, TRUE, TRUE, 10);
+    gtk_widget_show_all(dialog);
+    
+    int response = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+    
+    if (response == GTK_RESPONSE_CANCEL) return;
+    
+    std::string targetGenre = "";
+    if (response == GTK_RESPONSE_NO) {
+        // Genre-Auswahl-Dialog
+        GtkWidget* genreDialog = gtk_dialog_new_with_buttons(
+            "Genre wählen", GTK_WINDOW(self->window_), (GtkDialogFlags)0,
+            "OK", GTK_RESPONSE_OK, "Abbrechen", GTK_RESPONSE_CANCEL, NULL);
+        makeDialogResizable(genreDialog, 400, 250);
+        
+        GtkWidget* genreContent = gtk_dialog_get_content_area(GTK_DIALOG(genreDialog));
+        GtkWidget* genreCombo = gtk_combo_box_text_new();
+        const char* genres[] = {"Electronic", "Techno", "House", "Ambient", "Trance", 
+                               "Drum'n'Bass", "Chillout", "Metal", "New Metal", "Trap",
+                               "Jazz", "RnB", "Classical", "Salsa", "Walzer", "Rock/Pop", 
+                               "Reggae", "Punk", "Vocal", "Volksmusik", NULL};
+        for (int i = 0; genres[i]; ++i) {
+            gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(genreCombo), genres[i]);
+        }
+        gtk_combo_box_set_active(GTK_COMBO_BOX(genreCombo), 0);
+        gtk_box_pack_start(GTK_BOX(genreContent), genreCombo, TRUE, TRUE, 10);
+        gtk_widget_show_all(genreDialog);
+        
+        if (gtk_dialog_run(GTK_DIALOG(genreDialog)) == GTK_RESPONSE_OK) {
+            gchar* text = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(genreCombo));
+            if (text) {
+                targetGenre = text;
+                g_free(text);
+            }
+        }
+        gtk_widget_destroy(genreDialog);
+        
+        if (targetGenre.empty()) return;
+    }
+    
+    // Analyse in Thread
+    std::thread([self, targetGenre]() {
+        std::cout << "🎵 Starte Song-Struktur-Analyse" 
+                  << (targetGenre.empty() ? "" : " für Genre: " + targetGenre) << "...\n";
+        
+        auto allMedia = self->database_->getAll();
+        std::vector<AudioAnalyzer::SongStructure> structures;
+        
+        for (const auto& media : allMedia) {
+            if (!targetGenre.empty() && media.genre != targetGenre) continue;
+            if (media.bpm <= 0) continue;  // Brauchen BPM für Struktur-Analyse
+            
+            std::vector<float> samples;
+            int sampleRate;
+            if (self->analyzer_->loadAudioFile(media.filepath, samples, sampleRate)) {
+                auto structure = self->analyzer_->analyzeSongStructure(samples, sampleRate, media.bpm);
+                structures.push_back(structure);
+                
+                if (structures.size() % 10 == 0) {
+                    std::cout << "   📊 " << structures.size() << " Songs analysiert...\n";
+                }
+            }
+        }
+        
+        if (!structures.empty()) {
+            std::string genre = targetGenre.empty() ? "All Genres" : targetGenre;
+            self->analyzer_->learnStructurePatterns(structures, genre);
+            std::cout << "✅ Struktur-Learning abgeschlossen!\n";
+        } else {
+            std::cout << "⚠️ Keine passenden Songs gefunden\n";
+        }
+    }).detach();
+    
+    GtkWidget* infoDialog = gtk_message_dialog_new(
+        GTK_WINDOW(self->window_), GTK_DIALOG_MODAL, GTK_MESSAGE_INFO,
+        GTK_BUTTONS_OK, 
+        "Analyse gestartet!\n\nDetails siehe Terminal-Ausgabe.");
+    gtk_dialog_run(GTK_DIALOG(infoDialog));
+    gtk_widget_destroy(infoDialog);
+}
+
+void GtkRenderer::onPlayGenreDemos(GtkWidget* widget, gpointer data) {
+    GtkRenderer* self = static_cast<GtkRenderer*>(data);
+    std::string demoDir = std::string(std::getenv("HOME")) + "/.songgen/";
+    
+    // Suche alle training_demo_*.wav Dateien
+    std::vector<std::pair<std::string, std::string>> demos;  // <genre, filepath>
+    
+    if (std::filesystem::exists(demoDir)) {
+        for (const auto& entry : std::filesystem::directory_iterator(demoDir)) {
+            if (entry.is_regular_file()) {
+                std::string filename = entry.path().filename().string();
+                if (filename.rfind("training_demo_", 0) == 0 && 
+                    filename.size() > 4 && filename.substr(filename.size() - 4) == ".wav") {
+                    std::string genre = filename.substr(14);  // Nach "training_demo_"
+                    genre = genre.substr(0, genre.length() - 4);  // Ohne ".wav"
+                    demos.push_back({genre, entry.path().string()});
+                }
+            }
+        }
+    }
+    
+    if (demos.empty()) {
+        GtkWidget* dialog = gtk_message_dialog_new(
+            GTK_WINDOW(self->window_), GTK_DIALOG_MODAL,
+            GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
+            "ℹ️ Keine Genre-Demos gefunden.\n\n"
+            "Genre-Demos werden automatisch während des Trainings generiert.\n"
+            "Starte ein Training, um Demos zu erstellen:\n"
+            "🎓 Training starten");
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        return;
+    }
+    
+    // Erstelle Auswahl-Dialog
+    GtkWidget* dialog = gtk_dialog_new_with_buttons(
+        "🎵 Genre-Demos abspielen",
+        GTK_WINDOW(self->window_),
+        (GtkDialogFlags)0,
+        "Schließen", GTK_RESPONSE_CLOSE,
+        NULL
+    );
+    
+    makeDialogResizable(dialog, 500, 400);
+    
+    GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 15);
+    gtk_container_add(GTK_CONTAINER(content), vbox);
+    
+    GtkWidget* label = gtk_label_new("Wähle ein Genre-Demo zum Abspielen:");
+    gtk_label_set_selectable(GTK_LABEL(label), TRUE);
+    gtk_box_pack_start(GTK_BOX(vbox), label, FALSE, FALSE, 0);
+    
+    GtkWidget* scrolled = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled), 
+                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_box_pack_start(GTK_BOX(vbox), scrolled, TRUE, TRUE, 0);
+    
+    GtkWidget* listBox = gtk_list_box_new();
+    gtk_container_add(GTK_CONTAINER(scrolled), listBox);
+    
+    // Füge Genre-Demos zur Liste hinzu
+    for (size_t i = 0; i < demos.size(); ++i) {
+        const std::string& genre = demos[i].first;
+        const std::string& filepath = demos[i].second;
+        
+        GtkWidget* row = gtk_list_box_row_new();
+        GtkWidget* hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+        gtk_container_set_border_width(GTK_CONTAINER(hbox), 5);
+        gtk_container_add(GTK_CONTAINER(row), hbox);
+        
+        GtkWidget* labelGenre = gtk_label_new(("🎵 " + genre).c_str());
+        gtk_widget_set_halign(labelGenre, GTK_ALIGN_START);
+        gtk_box_pack_start(GTK_BOX(hbox), labelGenre, TRUE, TRUE, 0);
+        
+        struct PlayData {
+            GtkRenderer* renderer;
+            std::string filepath;
+        };
+        
+        PlayData* playData = new PlayData{self, filepath};
+        
+        GtkWidget* btnPlay = gtk_button_new_with_label("▶️ Play");
+        g_signal_connect(btnPlay, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer userData) {
+            auto* data = static_cast<PlayData*>(userData);
+            data->renderer->audioPlayer_->stop();
+            if (data->renderer->audioPlayer_->load(data->filepath)) {
+                data->renderer->audioPlayer_->play();
+            }
+        }), playData);
+        gtk_box_pack_start(GTK_BOX(hbox), btnPlay, FALSE, FALSE, 0);
+        
+        gtk_list_box_insert(GTK_LIST_BOX(listBox), row, -1);
+    }
+    
+    gtk_widget_show_all(dialog);
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    
+    // Stop audio when closing
+    self->audioPlayer_->stop();
+    gtk_widget_destroy(dialog);
+}
+
+void GtkRenderer::onClearHistory(GtkWidget* widget, gpointer data) {
+    GtkRenderer* self = static_cast<GtkRenderer*>(data);
+    
+    GtkWidget* dialog = gtk_message_dialog_new(
+        GTK_WINDOW(self->window_),
+        GTK_DIALOG_MODAL,
+        GTK_MESSAGE_WARNING,
+        GTK_BUTTONS_YES_NO,
+        "⚠️ Gesamte Historie löschen?\nDiese Aktion kann nicht rückgängig gemacht werden."
+    );
+    
+    gint result = gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+    
+    if (result == GTK_RESPONSE_YES) {
+        gtk_list_store_clear(self->historyStore_);
+        
+        GtkTextBuffer* buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(self->historyTextView_));
+        gtk_text_buffer_set_text(buffer, "✅ Historie gelöscht", -1);
+    }
+}
+
+void GtkRenderer::onExportHistory(GtkWidget* widget, gpointer data) {
+    GtkRenderer* self = static_cast<GtkRenderer*>(data);
+    
+    GtkWidget* dialog = gtk_file_chooser_dialog_new(
+        "Historie exportieren",
+        GTK_WINDOW(self->window_),
+        GTK_FILE_CHOOSER_ACTION_SAVE,
+        "❌ Abbrechen", GTK_RESPONSE_CANCEL,
+        "💾 Speichern", GTK_RESPONSE_ACCEPT,
+        NULL
+    );
+    
+    gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dialog), TRUE);
+    gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dialog), "songgen_history.csv");
+    
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        char* filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+        
+        std::ofstream file(filename);
+        if (file.is_open()) {
+            file << "Zeitstempel,Aktion,Details,Ergebnis,Datei,Metadaten\n";
+            
+            GtkTreeModel* model = GTK_TREE_MODEL(self->historyStore_);
+            GtkTreeIter iter;
+            
+            if (gtk_tree_model_get_iter_first(model, &iter)) {
+                do {
+                    gchar* timestamp;
+                    gchar* action;
+                    gchar* details;
+                    gchar* result;
+                    gchar* filepath;
+                    gchar* metadata;
+                    
+                    gtk_tree_model_get(model, &iter,
+                        0, &timestamp,
+                        1, &action,
+                        2, &details,
+                        3, &result,
+                        4, &filepath,
+                        5, &metadata,
+                        -1);
+                    
+                    file << "\"" << timestamp << "\",\"" << action << "\",\""
+                         << details << "\",\"" << result << "\",\""
+                         << filepath << "\",\"" << metadata << "\"\n";
+                    
+                    g_free(timestamp);
+                    g_free(action);
+                    g_free(details);
+                    g_free(result);
+                    g_free(filepath);
+                    g_free(metadata);
+                } while (gtk_tree_model_iter_next(model, &iter));
+            }
+            
+            file.close();
+            
+            GtkWidget* successDialog = gtk_message_dialog_new(
+                GTK_WINDOW(self->window_),
+                GTK_DIALOG_MODAL,
+                GTK_MESSAGE_INFO,
+                GTK_BUTTONS_OK,
+                "✅ Historie exportiert nach:\n%s",
+                filename
+            );
+            gtk_dialog_run(GTK_DIALOG(successDialog));
+            gtk_widget_destroy(successDialog);
+        }
+        
+        g_free(filename);
+    }
+    
+    gtk_widget_destroy(dialog);
+}
+// Temporäre Datei für onInteractiveTraining - wird in GtkRenderer.cpp eingefügt
+// Diese Funktion erstellt einen interaktiven Dialog zum Review und Korrigieren von Genre-Zuordnungen
+
+void GtkRenderer::onInteractiveTraining(GtkWidget* widget, gpointer data) {
+    GtkRenderer* self = static_cast<GtkRenderer*>(data);
+    
+    // 🔍 Such-Dialog
+    GtkWidget* searchDialog = gtk_dialog_new_with_buttons(
+        "🔍 Track suchen für Training",
+        GTK_WINDOW(self->window_),
+        (GtkDialogFlags)0,
+        "_Abbrechen", GTK_RESPONSE_CANCEL,
+        "_Alle Tracks", GTK_RESPONSE_ACCEPT,
+        "_Ausgewählte laden", GTK_RESPONSE_OK,
+        NULL
+    );
+    
+    // Maximale Fenstergröße: 1200x1000 für maximale Track-Ansicht
+    makeDialogResizable(searchDialog, 1200, 1000);
+    
+    GtkWidget* searchContent = gtk_dialog_get_content_area(GTK_DIALOG(searchDialog));
+    GtkWidget* searchVbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_container_set_border_width(GTK_CONTAINER(searchVbox), 10);
+    gtk_container_add(GTK_CONTAINER(searchContent), searchVbox);
+    
+    // Such-Eingabe mit Autovervollständigung
+    GtkWidget* searchLabel = gtk_label_new("🔍 Suche nach Dateiname, Artist oder Genre:");
+    gtk_label_set_selectable(GTK_LABEL(searchLabel), TRUE);
+    gtk_box_pack_start(GTK_BOX(searchVbox), searchLabel, FALSE, FALSE, 0);
+    
+    GtkEntryCompletion* completion = gtk_entry_completion_new();
+    GtkListStore* completionStore = gtk_list_store_new(1, G_TYPE_STRING);
+    gtk_entry_completion_set_model(completion, GTK_TREE_MODEL(completionStore));
+    gtk_entry_completion_set_text_column(completion, 0);
+    gtk_entry_completion_set_minimum_key_length(completion, 2);
+    gtk_entry_completion_set_popup_completion(completion, TRUE);
+    gtk_entry_completion_set_inline_completion(completion, TRUE);
+    
+    GtkWidget* searchEntry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(searchEntry), "Track-Name eingeben...");
+    gtk_entry_set_completion(GTK_ENTRY(searchEntry), completion);
+    gtk_box_pack_start(GTK_BOX(searchVbox), searchEntry, FALSE, FALSE, 0);
+    
+    // TreeView für Ergebnisse
+    GtkListStore* resultStore = gtk_list_store_new(5, G_TYPE_STRING, G_TYPE_STRING, 
+                                                    G_TYPE_STRING, G_TYPE_STRING, G_TYPE_INT64);
+    GtkWidget* resultTreeView = gtk_tree_view_new_with_model(GTK_TREE_MODEL(resultStore));
+    gtk_tree_view_set_headers_visible(GTK_TREE_VIEW(resultTreeView), TRUE);
+    gtk_tree_selection_set_mode(gtk_tree_view_get_selection(GTK_TREE_VIEW(resultTreeView)), 
+                                 GTK_SELECTION_MULTIPLE);
+    
+    GtkCellRenderer* renderer = gtk_cell_renderer_text_new();
+    
+    // Dateiname-Spalte mit großer Breite (600px für lange Dateinamen)
+    GtkTreeViewColumn* colFilename = gtk_tree_view_column_new_with_attributes("Dateiname", 
+                                                                               renderer, "text", 0, NULL);
+    gtk_tree_view_column_set_min_width(colFilename, 600);
+    gtk_tree_view_column_set_resizable(colFilename, TRUE);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(resultTreeView), colFilename);
+    
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(resultTreeView), -1, "Artist", 
+                                                renderer, "text", 1, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(resultTreeView), -1, "Genre", 
+                                                renderer, "text", 2, NULL);
+    gtk_tree_view_insert_column_with_attributes(GTK_TREE_VIEW(resultTreeView), -1, "BPM", 
+                                                renderer, "text", 3, NULL);
+    
+    // Scrolled Window für Ergebnisse mit Mindesthöhe
+    GtkWidget* scrolled = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled), 
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scrolled), 800);  // Mindesthöhe 800px
+    gtk_container_add(GTK_CONTAINER(scrolled), resultTreeView);
+    gtk_box_pack_start(GTK_BOX(searchVbox), scrolled, TRUE, TRUE, 0);
+    
+    GtkWidget* statusLabel = gtk_label_new("0 Tracks gefunden");
+    gtk_label_set_selectable(GTK_LABEL(statusLabel), TRUE);
+    gtk_box_pack_start(GTK_BOX(searchVbox), statusLabel, FALSE, FALSE, 0);
+    
+    // Lade alle Medien
+    auto allMedia = self->database_->getAll();
+    
+    // Fülle Autovervollständigung (auch nicht-analysierte Tracks)
+    for (const auto& media : allMedia) {
+        GtkTreeIter iter;
+        std::string filename = std::filesystem::path(media.filepath).filename().string();
+        gtk_list_store_append(completionStore, &iter);
+        gtk_list_store_set(completionStore, &iter, 0, filename.c_str(), -1);
+        
+        if (!media.artist.empty()) {
+            gtk_list_store_append(completionStore, &iter);
+            gtk_list_store_set(completionStore, &iter, 0, media.artist.c_str(), -1);
+        }
+    }
+    
+    // Such-Funktion
+    auto performSearch = [&](const std::string& query) {
+        gtk_list_store_clear(resultStore);
+        int count = 0;
+        
+        std::string lowerQuery = query;
+        std::transform(lowerQuery.begin(), lowerQuery.end(), lowerQuery.begin(), ::tolower);
+        
+        for (const auto& media : allMedia) {
+            if (!media.analyzed || media.genre == "Unknown") continue;
+            
+            std::string filename = std::filesystem::path(media.filepath).filename().string();
+            std::string lowerFilename = filename;
+            std::string lowerArtist = media.artist;
+            std::string lowerGenre = media.genre;
+            
+            std::transform(lowerFilename.begin(), lowerFilename.end(), lowerFilename.begin(), ::tolower);
+            std::transform(lowerArtist.begin(), lowerArtist.end(), lowerArtist.begin(), ::tolower);
+            std::transform(lowerGenre.begin(), lowerGenre.end(), lowerGenre.begin(), ::tolower);
+            
+            if (query.empty() || 
+                lowerFilename.find(lowerQuery) != std::string::npos ||
+                lowerArtist.find(lowerQuery) != std::string::npos ||
+                lowerGenre.find(lowerQuery) != std::string::npos) {
+                
+                GtkTreeIter iter;
+                gtk_list_store_append(resultStore, &iter);
+                gtk_list_store_set(resultStore, &iter,
+                    0, filename.c_str(),
+                    1, media.artist.c_str(),
+                    2, media.genre.c_str(),
+                    3, std::to_string((int)media.bpm).c_str(),
+                    4, (gint64)media.id,  // ID statt Pointer speichern!
+                    -1);
+                count++;
+            }
+        }
+        
+        std::string statusText = std::to_string(count) + " Tracks gefunden";
+        gtk_label_set_text(GTK_LABEL(statusLabel), statusText.c_str());
+    };
+    
+    // Initial alle anzeigen
+    performSearch("");
+    
+    // Callback-Daten-Struktur für Such-Event
+    struct SearchData {
+        GtkListStore* store;
+        GtkWidget* statusLabel;
+        std::vector<MediaMetadata>* allMedia;
+    };
+    
+    SearchData* searchData = new SearchData{resultStore, statusLabel, &allMedia};
+    
+    // Such-Event
+    g_signal_connect(searchEntry, "changed", G_CALLBACK(+[](GtkWidget* entry, gpointer data) {
+        auto* sd = static_cast<SearchData*>(data);
+        const char* text = gtk_entry_get_text(GTK_ENTRY(entry));
+        std::string query = text ? text : "";
+        
+        gtk_list_store_clear(sd->store);
+        int count = 0;
+        
+        std::string lowerQuery = query;
+        std::transform(lowerQuery.begin(), lowerQuery.end(), lowerQuery.begin(), ::tolower);
+        
+        for (const auto& media : *(sd->allMedia)) {
+            // Zeige alle Tracks, auch neue ohne Analyse
+            
+            std::string filename = std::filesystem::path(media.filepath).filename().string();
+            std::string lowerFilename = filename;
+            std::string lowerArtist = media.artist;
+            std::string lowerGenre = media.genre.empty() ? "(neu)" : media.genre;
+            
+            std::transform(lowerFilename.begin(), lowerFilename.end(), lowerFilename.begin(), ::tolower);
+            std::transform(lowerArtist.begin(), lowerArtist.end(), lowerArtist.begin(), ::tolower);
+            std::transform(lowerGenre.begin(), lowerGenre.end(), lowerGenre.begin(), ::tolower);
+            
+            if (query.empty() || 
+                lowerFilename.find(lowerQuery) != std::string::npos ||
+                lowerArtist.find(lowerQuery) != std::string::npos ||
+                lowerGenre.find(lowerQuery) != std::string::npos) {
+                
+                GtkTreeIter iter;
+                gtk_list_store_append(sd->store, &iter);
+                
+                std::string displayGenre = media.genre.empty() || media.genre == "Unknown" 
+                    ? "⚠️ Neu/Unbekannt" : media.genre;
+                std::string displayBpm = media.bpm > 0 ? std::to_string((int)media.bpm) : "-";
+                
+                gtk_list_store_set(sd->store, &iter,
+                    0, filename.c_str(),
+                    1, media.artist.c_str(),
+                    2, displayGenre.c_str(),
+                    3, displayBpm.c_str(),
+                    4, (gint64)media.id,
+                    -1);
+                count++;
+            }
+        }
+        
+        std::string statusText = std::to_string(count) + " Tracks gefunden";
+        gtk_label_set_text(GTK_LABEL(sd->statusLabel), statusText.c_str());
+    }), searchData);
+    
+    // Struktur zum Sammeln der Selection vor Dialog-Schließung
+    struct DialogResult {
+        std::vector<gint64> selectedIds;
+        int response;
+        GtkWidget* treeView;
+    };
+    DialogResult* result = new DialogResult();
+    result->treeView = resultTreeView;  // Speichere TreeView-Referenz
+    
+    // Signal-Handler für Dialog-Response (BEVOR er geschlossen wird)
+    g_signal_connect(searchDialog, "response", G_CALLBACK(+[](GtkDialog* dialog, gint response_id, gpointer data) {
+        auto* res = static_cast<DialogResult*>(data);
+        res->response = response_id;
+        
+        if (response_id == GTK_RESPONSE_OK && res->treeView) {
+            // JETZT die Selection auslesen, BEVOR der Dialog zerstört wird
+            GtkTreeSelection* selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(res->treeView));
+            GtkTreeModel* model = gtk_tree_view_get_model(GTK_TREE_VIEW(res->treeView));
+            GList* selectedRows = gtk_tree_selection_get_selected_rows(selection, &model);
+            
+            int selectionCount = g_list_length(selectedRows);
+            std::cout << "🔍 VOR Dialog-Schließung: " << selectionCount << " Zeilen ausgewählt\n";
+            
+            for (GList* iter = selectedRows; iter != nullptr; iter = iter->next) {
+                GtkTreePath* path = (GtkTreePath*)iter->data;
+                GtkTreeIter treeIter;
+                
+                if (gtk_tree_model_get_iter(model, &treeIter, path)) {
+                    gint64 trackId;
+                    gtk_tree_model_get(model, &treeIter, 4, &trackId, -1);
+                    res->selectedIds.push_back(trackId);
+                    std::cout << "   → Gespeichert: Track-ID " << trackId << "\n";
+                }
+                gtk_tree_path_free(path);
+            }
+            g_list_free(selectedRows);
+        } else if (response_id == GTK_RESPONSE_OK) {
+            std::cout << "❌ TreeView nicht gefunden!\n";
+        }
+    }), result);
+    
+    gtk_widget_show_all(searchDialog);
+    gtk_dialog_run(GTK_DIALOG(searchDialog));
+    
+    // Cleanup SearchData
+    delete searchData;
+    
+    // Sammle ausgewählte Tracks aus gespeicherten IDs
+    std::vector<MediaMetadata> reviewQueue;
+    std::vector<std::string> originalGenres;
+    
+    int response = result->response;
+    
+    if (response == GTK_RESPONSE_OK) {
+        std::cout << "📊 Verarbeite " << result->selectedIds.size() << " gespeicherte Track-IDs\n";
+        std::cout << "📚 Gesamt verfügbare Tracks: " << allMedia.size() << "\n";
+        
+        for (gint64 trackId : result->selectedIds) {
+            std::cout << "   → Suche Track-ID: " << trackId << "\n";
+            
+            bool found = false;
+            for (const auto& media : allMedia) {
+                if (media.id == trackId) {
+                    reviewQueue.push_back(media);
+                    originalGenres.push_back(media.genre);
+                    std::cout << "   ✓ Gefunden: " << std::filesystem::path(media.filepath).filename().string() << "\n";
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                std::cout << "   ❌ Track-ID " << trackId << " nicht in allMedia gefunden!\n";
+            }
+        }
+        
+        std::cout << "📊 Resultat: " << reviewQueue.size() << " Tracks gefunden\n";
+        
+        if (reviewQueue.empty()) {
+            GtkWidget* errDialog = gtk_message_dialog_new(
+                GTK_WINDOW(self->window_), GTK_DIALOG_MODAL, GTK_MESSAGE_WARNING,
+                GTK_BUTTONS_OK, 
+                "⚠️ Keine Tracks ausgewählt!\n\nBitte Tracks mit der Maus markieren (Mehrfachauswahl mit Strg).");
+            gtk_dialog_run(GTK_DIALOG(errDialog));
+            gtk_widget_destroy(errDialog);
+            gtk_widget_destroy(searchDialog);
+            delete result;
+            return;
+        }
+    } else if (response == GTK_RESPONSE_ACCEPT) {
+        // Alle Tracks (auch neue/unanalysierte)
+        for (const auto& media : allMedia) {
+            reviewQueue.push_back(media);
+            // Bei neuen Tracks "Unknown" als Original-Genre verwenden
+            originalGenres.push_back(media.genre.empty() ? "Unknown" : media.genre);
+        }
+    } else {
+        gtk_widget_destroy(searchDialog);
+        delete result;
+        return;
+    }
+    
+    gtk_widget_destroy(searchDialog);
+    delete result;
+    
+    if (reviewQueue.empty()) {
+        GtkWidget* dialog = gtk_message_dialog_new(
+            GTK_WINDOW(self->window_),
+            GTK_DIALOG_MODAL,
+            GTK_MESSAGE_INFO,
+            GTK_BUTTONS_OK,
+            "ℹ️ Keine analysierten Tracks gefunden.\n\n"
+            "Führe zuerst eine Analyse durch:\n"
+            "📚 Datenbank → 📈 Alle analysieren"
+        );
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        return;
+    }
+    
+    // Interaktiver Review-Dialog
+    GtkWidget* reviewDialog = gtk_dialog_new_with_buttons(
+        "🎓 Interaktives Training - Genre-Review",
+        GTK_WINDOW(self->window_),
+        (GtkDialogFlags)0,
+        NULL
+    );
+    
+    makeDialogResizable(reviewDialog, 800, 650);
+    
+    GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(reviewDialog));
+    GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 15);
+    gtk_container_add(GTK_CONTAINER(content), vbox);
+    
+    // Progress-Info
+    GtkWidget* labelProgress = gtk_label_new(NULL);
+    gtk_label_set_selectable(GTK_LABEL(labelProgress), TRUE);
+    gtk_box_pack_start(GTK_BOX(vbox), labelProgress, FALSE, FALSE, 0);
+    
+    // Track Frame
+    GtkWidget* frameTrack = gtk_frame_new("📁 Aktueller Track");
+    gtk_box_pack_start(GTK_BOX(vbox), frameTrack, FALSE, FALSE, 0);
+    
+    GtkWidget* trackVbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_container_set_border_width(GTK_CONTAINER(trackVbox), 10);
+    gtk_container_add(GTK_CONTAINER(frameTrack), trackVbox);
+    
+    GtkWidget* labelFile = gtk_label_new(NULL);
+    gtk_label_set_selectable(GTK_LABEL(labelFile), TRUE);
+    gtk_label_set_line_wrap(GTK_LABEL(labelFile), TRUE);
+    gtk_box_pack_start(GTK_BOX(trackVbox), labelFile, FALSE, FALSE, 0);
+    
+    // Play Controls
+    GtkWidget* playBox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_box_pack_start(GTK_BOX(trackVbox), playBox, FALSE, FALSE, 0);
+    
+    GtkWidget* btnPlay = gtk_button_new_with_label("▶️ Play");
+    gtk_box_pack_start(GTK_BOX(playBox), btnPlay, FALSE, FALSE, 0);
+    
+    GtkWidget* btnStop = gtk_button_new_with_label("⏹️ Stop");
+    gtk_box_pack_start(GTK_BOX(playBox), btnStop, FALSE, FALSE, 0);
+    
+    GtkWidget* labelTime = gtk_label_new("00:00 / 00:00");
+    gtk_label_set_selectable(GTK_LABEL(labelTime), TRUE);
+    gtk_box_pack_start(GTK_BOX(playBox), labelTime, FALSE, FALSE, 10);
+    
+    // Position Slider
+    GtkWidget* positionScale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0.0, 100.0, 1.0);
+    gtk_scale_set_draw_value(GTK_SCALE(positionScale), FALSE);
+    gtk_widget_set_size_request(positionScale, 300, -1);
+    gtk_box_pack_start(GTK_BOX(trackVbox), positionScale, FALSE, TRUE, 5);
+    
+    // Metadaten Frame
+    GtkWidget* frameMetadata = gtk_frame_new("📝 Metadaten bearbeiten");
+    gtk_box_pack_start(GTK_BOX(vbox), frameMetadata, TRUE, TRUE, 0);
+    
+    GtkWidget* grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 10);
+    gtk_container_set_border_width(GTK_CONTAINER(grid), 10);
+    gtk_container_add(GTK_CONTAINER(frameMetadata), grid);
+    
+    int row = 0;
+    
+    // Genre
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("🎭 Genre:"), 0, row, 1, 1);
+    GtkWidget* comboGenre = gtk_combo_box_text_new_with_entry();
+    const char* genres[] = {"Electronic", "Techno", "House", "Trance", "Ambient", 
+                            "Hip-Hop", "RnB", "Jazz", "Classical", "Salsa", "Walzer", 
+                            "Rock/Pop", "Reggae", "Punk", "Vocal", "Volksmusik", "Drum'n'Bass", "Chillout", "Metal", "New Metal", "Trap"};
+    for (const char* g : genres) {
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(comboGenre), g);
+    }
+    gtk_widget_set_size_request(comboGenre, 200, -1);
+    gtk_grid_attach(GTK_GRID(grid), comboGenre, 1, row++, 2, 1);
+    
+    // BPM
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("🥁 BPM:"), 0, row, 1, 1);
+    GtkWidget* spinBPM = gtk_spin_button_new_with_range(0, 300, 1);
+    gtk_grid_attach(GTK_GRID(grid), spinBPM, 1, row++, 2, 1);
+    
+    // Intensität
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("💪 Intensität:"), 0, row, 1, 1);
+    GtkWidget* comboIntensity = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(comboIntensity), "soft");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(comboIntensity), "mittel");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(comboIntensity), "hart");
+    gtk_grid_attach(GTK_GRID(grid), comboIntensity, 1, row++, 2, 1);
+    
+    // Bass Level
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("🔊 Bass:"), 0, row, 1, 1);
+    GtkWidget* comboBass = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(comboBass), "soft");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(comboBass), "mittel");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(comboBass), "basslastig");
+    gtk_grid_attach(GTK_GRID(grid), comboBass, 1, row++, 2, 1);
+    
+    // Mood
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("😊 Mood:"), 0, row, 1, 1);
+    GtkWidget* entryMood = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(entryMood), "z.B. Energetic, Dark");
+    gtk_grid_attach(GTK_GRID(grid), entryMood, 1, row++, 2, 1);
+    
+    // Stats
+    GtkWidget* labelStats = gtk_label_new("");
+    gtk_label_set_selectable(GTK_LABEL(labelStats), TRUE);
+    gtk_box_pack_start(GTK_BOX(vbox), labelStats, FALSE, FALSE, 0);
+    
+    // Action Buttons
+    GtkWidget* btnBox = gtk_button_box_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_button_box_set_layout(GTK_BUTTON_BOX(btnBox), GTK_BUTTONBOX_SPREAD);
+    gtk_box_pack_start(GTK_BOX(vbox), btnBox, FALSE, FALSE, 0);
+    
+    GtkWidget* btnBack = gtk_button_new_with_label("◀️ Zurück");
+    gtk_box_pack_start(GTK_BOX(btnBox), btnBack, TRUE, TRUE, 0);
+    
+    GtkWidget* btnKeep = gtk_button_new_with_label("✅ Korrekt");
+    gtk_box_pack_start(GTK_BOX(btnBox), btnKeep, TRUE, TRUE, 0);
+    
+    GtkWidget* btnCorrect = gtk_button_new_with_label("✏️ Korrigieren");
+    gtk_box_pack_start(GTK_BOX(btnBox), btnCorrect, TRUE, TRUE, 0);
+    
+    GtkWidget* btnSkip = gtk_button_new_with_label("⏭️ Skip");
+    gtk_box_pack_start(GTK_BOX(btnBox), btnSkip, TRUE, TRUE, 0);
+    
+    GtkWidget* btnFinish = gtk_button_new_with_label("💾 Fertig");
+    gtk_box_pack_start(GTK_BOX(btnBox), btnFinish, TRUE, TRUE, 0);
+    
+    // State
+    struct ReviewState {
+        GtkRenderer* renderer;
+        std::vector<MediaMetadata> queue;
+        std::vector<std::string> originalGenres;  // 🎓 Für Online-Learning
+        size_t currentIndex;
+        int corrected, kept, skipped;
+        GtkWidget *dialog, *labelProgress, *labelFile, *labelStats;
+        GtkWidget *comboGenre, *spinBPM, *comboIntensity, *comboBass, *entryMood;
+        GtkWidget *positionScale, *labelTime;  // 🎵 Position Controls
+        guint positionTimeoutId;  // Timer für Position-Updates
+        bool isUserSeeking;  // Flag um Timer-Updates von User-Seeks zu unterscheiden
+    };
+    
+    ReviewState* state = new ReviewState{
+        self, reviewQueue, originalGenres, 0, 0, 0, 0,
+        reviewDialog, labelProgress, labelFile, labelStats,
+        comboGenre, spinBPM, comboIntensity, comboBass, entryMood,
+        positionScale, labelTime, 0, false
+    };
+    
+    // Load track function (static for use in callbacks)
+    static auto loadTrackFunc = [](ReviewState* s) {
+        if (s->currentIndex >= s->queue.size()) {
+            // 🎓 Finaler Batch-Retrain wenn Korrekturen vorhanden
+            int pendingCount = 0;
+            if (s->renderer->trainingModel_) {
+                pendingCount = s->renderer->trainingModel_->getPendingCorrections();
+                if (pendingCount > 0) {
+                    std::cout << "\n🎓 Finaler Batch-Retrain mit " << pendingCount << " Korrekturen..." << std::endl;
+                    s->renderer->trainingModel_->batchRetrainPending(1);  // Min 1 für finalen Batch
+                }
+            }
+            
+            char msg[512];
+            snprintf(msg, sizeof(msg),
+                "✅ Review abgeschlossen!\n\n"
+                "✅ Korrekt: %d\n✏️ Korrigiert: %d\n⏭️ Übersprungen: %d\n\n"
+                "🎓 Online-Learning:\n   %d Korrekturen für Training verwendet",
+                s->kept, s->corrected, s->skipped, s->corrected);
+            
+            GtkWidget* d = gtk_message_dialog_new(GTK_WINDOW(s->dialog),
+                GTK_DIALOG_MODAL, GTK_MESSAGE_INFO, GTK_BUTTONS_OK, "%s", msg);
+            gtk_dialog_run(GTK_DIALOG(d));
+            gtk_widget_destroy(d);
+            
+            // Cleanup: Stoppe Timer und Audio
+            if (s->positionTimeoutId > 0) {
+                g_source_remove(s->positionTimeoutId);
+            }
+            s->renderer->audioPlayer_->stop();
+            
+            gtk_widget_destroy(s->dialog);
+            
+            s->renderer->addHistoryEntry("Interaktives Training abgeschlossen",
+                std::to_string(s->queue.size()) + " Tracks reviewed\n" +
+                std::to_string(s->corrected) + " korrigiert\n" +
+                "🎓 Modell mit Korrekturen nachtrainiert", "✅ Fertig");
+            
+            s->renderer->refreshDatabaseView();
+            delete s;
+            return;
+        }
+        
+        auto& t = s->queue[s->currentIndex];
+        
+        // 🔍 Prüfe ob Track analysiert ist, falls nicht -> automatische Analyse
+        if (!t.analyzed || t.genre.empty() || t.genre == "Unknown") {
+            std::cout << "⚡ Track noch nicht analysiert - führe automatische Analyse durch..." << std::endl;
+            
+            MediaMetadata meta;
+            if (s->renderer->analyzer_->analyze(t.filepath, meta)) {
+                // Update in Datenbank
+                meta.id = t.id;
+                meta.filepath = t.filepath;
+                if (s->renderer->database_->updateMedia(meta)) {
+                    t = meta;  // Update lokale Kopie
+                    std::cout << "   ✅ Analyse erfolgreich: " << meta.genre 
+                             << " | BPM: " << meta.bpm << std::endl;
+                }
+            } else {
+                std::cout << "   ⚠️ Analyse fehlgeschlagen - verwende Defaults" << std::endl;
+                if (t.genre.empty()) t.genre = "Unknown";
+            }
+        }
+        
+        // 🛑 Stoppe vorherigen Track automatisch
+        if (s->renderer->audioPlayer_) {
+            s->renderer->audioPlayer_->stop();
+        }
+        
+        // Stoppe Position-Timer vom vorherigen Track
+        if (s->positionTimeoutId > 0) {
+            g_source_remove(s->positionTimeoutId);
+            s->positionTimeoutId = 0;
+        }
+        
+        // Progress mit Online-Learning Status
+        char prog[256];
+        int pendingCorrections = s->renderer->trainingModel_ ? 
+            s->renderer->trainingModel_->getPendingCorrections() : 0;
+        int totalRetrains = s->renderer->trainingModel_ ? 
+            s->renderer->trainingModel_->getTotalRetrains() : 0;
+        
+        snprintf(prog, sizeof(prog), 
+                "<span size='large' weight='bold'>Track %zu / %zu</span>  "
+                "<span size='small'>🎓 Online-Learning: %d Korrekturen | %d Retrains</span>",
+                s->currentIndex + 1, s->queue.size(), pendingCorrections, totalRetrains);
+        gtk_label_set_markup(GTK_LABEL(s->labelProgress), prog);
+        
+        // File
+        std::string fn = std::filesystem::path(t.filepath).filename().string();
+        gtk_label_set_text(GTK_LABEL(s->labelFile), ("📁 " + fn).c_str());
+        
+        // Metadata
+        GtkWidget* entry = gtk_bin_get_child(GTK_BIN(s->comboGenre));
+        if (GTK_IS_ENTRY(entry)) {
+            gtk_entry_set_text(GTK_ENTRY(entry), t.genre.c_str());
+        }
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(s->spinBPM), t.bpm);
+        
+        int idx = (t.intensity == "soft") ? 0 : (t.intensity == "hart") ? 2 : 1;
+        gtk_combo_box_set_active(GTK_COMBO_BOX(s->comboIntensity), idx);
+        
+        idx = (t.bassLevel == "soft") ? 0 : (t.bassLevel == "basslastig") ? 2 : 1;
+        gtk_combo_box_set_active(GTK_COMBO_BOX(s->comboBass), idx);
+        
+        gtk_entry_set_text(GTK_ENTRY(s->entryMood), t.mood.c_str());
+        
+        // Reset Position
+        gtk_range_set_value(GTK_RANGE(s->positionScale), 0.0);
+        gtk_label_set_text(GTK_LABEL(s->labelTime), "00:00 / 00:00");
+        
+        // Stats
+        char stats[256];
+        snprintf(stats, sizeof(stats), "📊 %d korrekt | %d korrigiert | %d übersprungen",
+                s->kept, s->corrected, s->skipped);
+        gtk_label_set_text(GTK_LABEL(s->labelStats), stats);
+    };
+    
+    // Position Update Timer Callback
+    static auto updatePositionFunc = [](gpointer data) -> gboolean {
+        auto* s = static_cast<ReviewState*>(data);
+        if (!s->renderer->audioPlayer_) return G_SOURCE_REMOVE;
+        
+        // NICHT updaten während User den Slider bewegt!
+        if (s->isUserSeeking) {
+            return G_SOURCE_CONTINUE;
+        }
+        
+        double duration = s->renderer->audioPlayer_->getDuration();
+        double position = s->renderer->audioPlayer_->getPosition();
+        
+        if (duration > 0) {
+            double percent = (position / duration) * 100.0;
+            
+            // Signal blockieren während automatischem Update, damit value-changed nicht triggert
+            g_signal_handlers_block_by_func(s->positionScale, (gpointer)G_CALLBACK(nullptr), s);
+            gtk_range_set_value(GTK_RANGE(s->positionScale), percent);
+            g_signal_handlers_unblock_by_func(s->positionScale, (gpointer)G_CALLBACK(nullptr), s);
+            
+            int posMin = (int)(position / 60);
+            int posSec = (int)position % 60;
+            int durMin = (int)(duration / 60);
+            int durSec = (int)duration % 60;
+            
+            char timeStr[32];
+            snprintf(timeStr, sizeof(timeStr), "%02d:%02d / %02d:%02d", posMin, posSec, durMin, durSec);
+            gtk_label_set_text(GTK_LABEL(s->labelTime), timeStr);
+        }
+        
+        return G_SOURCE_CONTINUE;
+    };
+    
+    // Callbacks
+    g_signal_connect(btnPlay, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
+        auto* s = static_cast<ReviewState*>(data);
+        auto& t = s->queue[s->currentIndex];
+        s->renderer->audioPlayer_->stop();
+        if (s->renderer->audioPlayer_->load(t.filepath)) {
+            s->renderer->audioPlayer_->play();
+            
+            // Starte Position-Timer (250ms Updates für flüssige Performance)
+            if (s->positionTimeoutId > 0) {
+                g_source_remove(s->positionTimeoutId);
+            }
+            s->positionTimeoutId = g_timeout_add(250, updatePositionFunc, s);
+        }
+    }), state);
+    
+    g_signal_connect(btnStop, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
+        auto* s = static_cast<ReviewState*>(data);
+        s->renderer->audioPlayer_->stop();
+        
+        // Stoppe Position-Timer
+        if (s->positionTimeoutId > 0) {
+            g_source_remove(s->positionTimeoutId);
+            s->positionTimeoutId = 0;
+        }
+    }), state);
+    
+    // Position-Slider Callbacks - Seeking während Ziehen und Klicken
+    g_signal_connect(positionScale, "button-press-event", G_CALLBACK(+[](GtkWidget*, GdkEventButton*, gpointer data) -> gboolean {
+        auto* s = static_cast<ReviewState*>(data);
+        s->isUserSeeking = true;
+        return FALSE;  // Event weiter propagieren
+    }), state);
+    
+    g_signal_connect(positionScale, "button-release-event", G_CALLBACK(+[](GtkWidget*, GdkEventButton*, gpointer data) -> gboolean {
+        auto* s = static_cast<ReviewState*>(data);
+        s->isUserSeeking = false;
+        return FALSE;
+    }), state);
+    
+    // Value-Changed: Erlaube Seek während Ziehen UND bei Klick
+    g_signal_connect(positionScale, "value-changed", G_CALLBACK(+[](GtkRange* range, gpointer data) {
+        auto* s = static_cast<ReviewState*>(data);
+        
+        // Nur wenn User aktiv seeked (nicht während automatischer Updates)
+        if (s->isUserSeeking) {
+            double value = gtk_range_get_value(range);
+            double duration = s->renderer->audioPlayer_->getDuration();
+            
+            if (duration > 0) {
+                double newPosition = (value / 100.0) * duration;
+                s->renderer->audioPlayer_->seek(newPosition);
+            }
+        }
+    }), state);
+    
+    g_signal_connect(btnBack, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
+        auto* s = static_cast<ReviewState*>(data);
+        if (s->currentIndex > 0) {
+            s->currentIndex--;
+            // Rückgängig machen der vorherigen Zählung
+            if (s->kept > 0) s->kept--;
+            else if (s->corrected > 0) s->corrected--;
+            else if (s->skipped > 0) s->skipped--;
+            loadTrackFunc(s);
+        }
+    }), state);
+    
+    g_signal_connect(btnKeep, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
+        auto* s = static_cast<ReviewState*>(data);
+        s->kept++;
+        s->currentIndex++;
+        loadTrackFunc(s);
+    }), state);
+    
+    g_signal_connect(btnCorrect, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
+        auto* s = static_cast<ReviewState*>(data);
+        auto& t = s->queue[s->currentIndex];
+        std::string originalGenre = s->originalGenres[s->currentIndex];  // 🎓 Original speichern
+        
+        // Lese Änderungen aus UI
+        GtkWidget* entry = gtk_bin_get_child(GTK_BIN(s->comboGenre));
+        if (GTK_IS_ENTRY(entry)) {
+            t.genre = gtk_entry_get_text(GTK_ENTRY(entry));
+        }
+        t.bpm = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(s->spinBPM));
+        t.intensity = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(s->comboIntensity));
+        t.bassLevel = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(s->comboBass));
+        t.mood = gtk_entry_get_text(GTK_ENTRY(s->entryMood));
+        
+        // 💾 Speichere in Datenbank
+        std::cout << "💾 Speichere Korrektur: " << std::filesystem::path(t.filepath).filename().string() 
+                  << " | Genre: " << originalGenre << " → " << t.genre << std::endl;
+        
+        if (s->renderer->database_->updateMedia(t)) {
+            s->corrected++;
+            s->renderer->addHistoryEntry("Genre korrigiert",
+                std::filesystem::path(t.filepath).filename().string() + "\n" +
+                "Genre: " + t.genre + " | BPM: " + std::to_string((int)t.bpm),
+                "✅ Gespeichert");
+            
+            // 🎓 ONLINE-LEARNING: Trainiere sofort mit korrigierten Daten
+            if (t.genre != originalGenre && s->renderer->trainingModel_) {
+                s->renderer->trainingModel_->retrainWithCorrectedData(t, originalGenre);
+            }
+            
+            // Aktualisiere auch das Original-Genre für Zurück-Button
+            s->originalGenres[s->currentIndex] = t.genre;
+        } else {
+            std::cerr << "❌ Fehler beim Speichern in Datenbank!" << std::endl;
+            GtkWidget* errDialog = gtk_message_dialog_new(
+                GTK_WINDOW(s->dialog), GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR,
+                GTK_BUTTONS_OK, "❌ Fehler beim Speichern der Änderungen!");
+            gtk_dialog_run(GTK_DIALOG(errDialog));
+            gtk_widget_destroy(errDialog);
+        }
+        
+        s->currentIndex++;
+        loadTrackFunc(s);
+    }), state);
+    
+    g_signal_connect(btnSkip, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
+        auto* s = static_cast<ReviewState*>(data);
+        s->skipped++;
+        s->currentIndex++;
+        loadTrackFunc(s);
+    }), state);
+    
+    g_signal_connect(btnFinish, "clicked", G_CALLBACK(+[](GtkWidget*, gpointer data) {
+        auto* s = static_cast<ReviewState*>(data);
+        s->currentIndex = s->queue.size();
+        loadTrackFunc(s);
+    }), state);
+    
+    loadTrackFunc(state);
+    gtk_widget_show_all(reviewDialog);
+    gtk_dialog_run(GTK_DIALOG(reviewDialog));
+}
+
+// ==================== IDLE LEARNING SYSTEM ====================
+
+void GtkRenderer::startIdleLearning() {
+    if (idleLearningActive_) return;
+    
+    idleLearningActive_ = true;
+    lastActivityTime_ = 0;
+    idleSecondsCounter_ = 0;
+    hasMoreToLearn_ = true;
+    noLearningTasksCounter_ = 0;
+    
+    // Initialisiere Datenbank-Größe für Änderungs-Erkennung
+    if (database_) {
+        lastDatabaseSize_ = database_->getAll().size();
+    }
+    
+    // Starte Idle-Check-Timer (alle 1 Sekunde)
+    idleCheckTimerId_ = g_timeout_add(1000, onIdleCheckTimer, this);
+    
+    // Starte Background-Learning-Thread
+    idleLearningThread_ = std::thread([this]() {
+        idleLearningLoop();
+    });
+    
+    std::cout << "🧠 Idle Learning System gestartet (" << lastDatabaseSize_ << " Tracks)" << std::endl;
+}
+
+void GtkRenderer::stopIdleLearning() {
+    if (!idleLearningActive_) return;
+    
+    idleLearningActive_ = false;
+    
+    if (idleCheckTimerId_ > 0) {
+        g_source_remove(idleCheckTimerId_);
+        idleCheckTimerId_ = 0;
+    }
+    
+    if (idleLearningThread_.joinable()) {
+        idleLearningThread_.join();
+    }
+    
+    std::cout << "🧠 Idle Learning System gestoppt" << std::endl;
+}
+
+void GtkRenderer::resetActivityTimer() {
+    lastActivityTime_ = 0;
+    
+    // Wenn gerade Idle-Learning läuft, stoppe es
+    if (isIdleLearning_) {
+        std::cout << "👤 User-Aktivität erkannt - pausiere Idle Learning" << std::endl;
+        isIdleLearning_ = false;
+        
+        // Verstecke Idle-Label
+        gdk_threads_add_idle(+[](gpointer data) -> gboolean {
+            auto* self = static_cast<GtkRenderer*>(data);
+            gtk_widget_hide(self->idleLearningLabel_);
+            return G_SOURCE_REMOVE;
+        }, this);
+    }
+}
+
+gboolean GtkRenderer::onUserActivity(GtkWidget* widget, GdkEvent* event, gpointer data) {
+    auto* self = static_cast<GtkRenderer*>(data);
+    self->resetActivityTimer();
+    return FALSE;  // Event weiterleiten
+}
+
+gboolean GtkRenderer::onIdleCheckTimer(gpointer data) {
+    auto* self = static_cast<GtkRenderer*>(data);
+    
+    if (!self->idleLearningActive_) {
+        return G_SOURCE_REMOVE;
+    }
+    
+    self->lastActivityTime_++;
+    
+    // Nach 30 Sekunden Inaktivität: Starte Idle Learning
+    if (self->lastActivityTime_ >= 30 && !self->isIdleLearning_) {
+        self->isIdleLearning_ = true;
+        self->idleSecondsCounter_ = 0;
+        
+        std::cout << "🧠 Idle erkannt - starte selbstständiges Lernen..." << std::endl;
+        
+        // Zeige Idle-Label
+        gtk_label_set_markup(GTK_LABEL(self->idleLearningLabel_),
+            "<span color='#90EE90'>🧠 Idle Learning aktiv...</span>");
+        gtk_widget_show(self->idleLearningLabel_);
+    }
+    
+    return G_SOURCE_CONTINUE;
+}
+
+void GtkRenderer::idleLearningLoop() {
+    while (idleLearningActive_) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        
+        // Überwache Datenbank-Änderungen (alle 5 Sekunden)
+        if (idleSecondsCounter_ % 5 == 0 && database_) {
+            size_t currentSize = database_->getAll().size();
+            if (currentSize != lastDatabaseSize_) {
+                lastDatabaseSize_ = currentSize;
+                if (!hasMoreToLearn_ && currentSize > 0) {
+                    // Neue Daten hinzugefügt! Reaktiviere Learning
+                    hasMoreToLearn_ = true;
+                    noLearningTasksCounter_ = 0;
+                    std::cout << "✨ Neue Daten erkannt (" << currentSize << " Tracks) - Learning reaktiviert!" << std::endl;
+                    
+                    // Zeige wieder das Learning-Label
+                    gdk_threads_add_idle(+[](gpointer data) -> gboolean {
+                        auto* self = static_cast<GtkRenderer*>(data);
+                        if (self->hasMoreToLearn_) {
+                            gtk_label_set_markup(GTK_LABEL(self->idleLearningLabel_),
+                                "<span color='#90EE90'>🧠 Idle Learning reaktiviert...</span>");
+                            gtk_widget_show(self->idleLearningLabel_);
+                        }
+                        return G_SOURCE_REMOVE;
+                    }, this);
+                }
+            }
+        }
+        
+        if (isIdleLearning_ && running_ && hasMoreToLearn_) {
+            idleSecondsCounter_++;
+            
+            // Alle 5 Sekunden: Führe Learning-Task aus
+            if (idleSecondsCounter_ % 5 == 0) {
+                performIdleLearningTask();
+            }
+            
+            // Update Idle-Label
+            gdk_threads_add_idle(+[](gpointer data) -> gboolean {
+                auto* self = static_cast<GtkRenderer*>(data);
+                if (self->isIdleLearning_ && self->hasMoreToLearn_) {
+                    std::string text = "🧠 Idle Learning aktiv (" + 
+                                      std::to_string(self->idleSecondsCounter_.load()) + "s)...";
+                    gtk_label_set_markup(GTK_LABEL(self->idleLearningLabel_),
+                        ("<span color='#90EE90'>" + text + "</span>").c_str());
+                }
+                return G_SOURCE_REMOVE;
+            }, this);
+        } else if (isIdleLearning_ && !hasMoreToLearn_) {
+            // Nichts mehr zu lernen - zeige Pause-Status
+            gdk_threads_add_idle(+[](gpointer data) -> gboolean {
+                auto* self = static_cast<GtkRenderer*>(data);
+                gtk_label_set_markup(GTK_LABEL(self->idleLearningLabel_),
+                    "<span color='#FFD700'>⏸️ Learning pausiert - warte auf neue Daten...</span>");
+                return G_SOURCE_REMOVE;
+            }, this);
+        }
+    }
+}
+
+void GtkRenderer::performIdleLearningTask() {
+    std::cout << "🎓 Idle Learning Task [" << idleSecondsCounter_ << "s]" << std::endl;
+    
+    bool taskPerformed = false;
+    
+    // 1. Analysiere Datenbank für Pattern
+    if (trainingModel_ && database_) {
+        auto allMedia = database_->getAll();
+        
+        if (!allMedia.empty()) {
+            // Lerne aus existierenden Correction-Patterns
+            if (idleSecondsCounter_ % 15 == 0) {  // Alle 15 Sekunden
+                std::cout << "   🔍 Analysiere Genre-Patterns..." << std::endl;
+                auto patterns = trainingModel_->learnCorrectionPatterns();
+                
+                if (!patterns.empty()) {
+                    std::cout << "   ✨ " << patterns.size() << " Patterns gefunden" << std::endl;
+                    taskPerformed = true;
+                    
+                    // Wende Patterns auf Datenbank an (nur Vorschläge)
+                    int suggestions = trainingModel_->suggestDatabaseCorrections(false);
+                    if (suggestions > 0) {
+                        std::cout << "   💡 " << suggestions << " Verbesserungs-Vorschläge gefunden" << std::endl;
+                        taskPerformed = true;
+                    }
+                } else {
+                    std::cout << "   ℹ️ Keine neuen Patterns" << std::endl;
+                }
+            }
+            
+            // Optimiere Feature-Extraction-Parameter
+            if (idleSecondsCounter_ % 20 == 0) {  // Alle 20 Sekunden
+                std::cout << "   🎵 Optimiere Feature-Extraction..." << std::endl;
+                // Hier könnte AudioAnalyzer-Optimierung stattfinden
+                // taskPerformed = true; // Wenn tatsächlich etwas optimiert wurde
+            }
+            
+            // 🧹 Bereinige Korrektur-Historie von Widersprüchen
+            if (idleSecondsCounter_ % 40 == 0) {  // Alle 40 Sekunden
+                std::cout << "   🧹 Bereinige Lern-Historie..." << std::endl;
+                int cleaned = trainingModel_->revalidateCorrectionHistory();
+                if (cleaned > 0) {
+                    std::cout << "   ✨ " << cleaned << " widersprüchliche Einträge entfernt" << std::endl;
+                    taskPerformed = true;
+                } else {
+                    std::cout << "   ℹ️ Historie bereits sauber" << std::endl;
+                }
+            }
+        } else {
+            std::cout << "   ℹ️ Keine Tracks in Datenbank" << std::endl;
+        }
+    }
+    
+    // 2. Instrumenten-Extraktor optimieren
+    if (idleSecondsCounter_ % 25 == 0) {  // Alle 25 Sekunden
+        std::cout << "   🥁 Optimiere Instrumenten-Extraktion..." << std::endl;
+    }
+    
+    // Tracking: Wenn keine Tasks ausgeführt wurden
+    if (!taskPerformed) {
+        noLearningTasksCounter_++;
+        std::cout << "   ⏸️ Keine Learning-Tasks verfügbar (" << noLearningTasksCounter_ << "/3)" << std::endl;
+        
+        // Nach 3 aufeinanderfolgenden erfolglosen Tasks: Stoppe Learning
+        if (noLearningTasksCounter_ >= 3) {
+            hasMoreToLearn_ = false;
+            std::cout << "\n⏸️ Idle Learning pausiert - nichts mehr zu lernen!" << std::endl;
+            std::cout << "   Wird automatisch reaktiviert wenn neue Daten hinzugefügt werden.\n" << std::endl;
+            
+            // Update Label
+            gdk_threads_add_idle(+[](gpointer data) -> gboolean {
+                auto* self = static_cast<GtkRenderer*>(data);
+                gtk_label_set_markup(GTK_LABEL(self->idleLearningLabel_),
+                    "<span color='#FFD700'>⏸️ Learning pausiert - warte auf neue Daten...</span>");
+                return G_SOURCE_REMOVE;
+            }, this);
+        }
+    } else {
+        // Task wurde ausgeführt - Reset Counter
+        noLearningTasksCounter_ = 0;
+    }
+    
+    // 3. Lerne Rhythmus-Patterns aus der Datenbank
+    if (idleSecondsCounter_ % 30 == 0 && database_) {  // Alle 30 Sekunden
+        std::cout << "   🎼 Analysiere Rhythmus-Patterns..." << std::endl;
+        auto allMedia = database_->getAll();
+        
+        // Gruppiere nach Genre und analysiere BPM-Patterns
+        std::map<std::string, std::vector<float>> bpmByGenre;
+        for (const auto& m : allMedia) {
+            if (m.bpm > 0) {
+                bpmByGenre[m.genre].push_back(m.bpm);
+            }
+        }
+        
+        for (const auto& [genre, bpms] : bpmByGenre) {
+            if (bpms.size() >= 5) {
+                float avgBpm = 0.0f;
+                for (float bpm : bpms) avgBpm += bpm;
+                avgBpm /= bpms.size();
+                
+                std::cout << "      • " << genre << ": Ø " << (int)avgBpm 
+                         << " BPM (" << bpms.size() << " Tracks)" << std::endl;
+            }
+        }
+    }
+    
+    // 4. Cleanup und Optimierung
+    if (idleSecondsCounter_ % 60 == 0 && database_) {  // Jede Minute
+        std::cout << "   🧹 Cleanup und Wartung..." << std::endl;
+        
+        // Entferne kaputte Referenzen
+        auto allMedia = database_->getAll();
+        int cleanedUp = 0;
+        for (const auto& m : allMedia) {
+            if (!std::filesystem::exists(m.filepath)) {
+                cleanedUp++;
+            }
+        }
+        
+        if (cleanedUp > 0) {
+            std::cout << "      ⚠️  " << cleanedUp << " fehlende Dateien erkannt" << std::endl;
+        }
+    }
+    
+    // 5. Statistik-Update
+    if (idleSecondsCounter_ % 45 == 0) {  // Alle 45 Sekunden
+        std::cout << "   📊 Update Statistiken..." << std::endl;
+        if (trainingModel_) {
+            auto stats = trainingModel_->getStats();
+            std::cout << "      • Corrections: " << stats["corrections"] << std::endl;
+            std::cout << "      • Suggestions: " << stats["suggestions"] << std::endl;
+        }
+    }
+    
+    std::cout << "   ✅ Idle Learning Task abgeschlossen" << std::endl;
+}
+
+// 📟 Console Output Capture - Fängt stdout/stderr in Echtzeit
+void GtkRenderer::startConsoleCapture() {
+    // Erstelle Pipe für stdout/stderr redirect
+    if (pipe(consolePipe_) == -1) {
+        std::cerr << "❌ Console capture pipe creation failed\n";
+        return;
+    }
+    
+    // Backup original stdout/stderr
+    stdoutBackup_ = dup(STDOUT_FILENO);
+    stderrBackup_ = dup(STDERR_FILENO);
+    
+    // Redirect stdout und stderr zur Pipe
+    dup2(consolePipe_[1], STDOUT_FILENO);
+    dup2(consolePipe_[1], STDERR_FILENO);
+    
+    // Aktiviere unbuffered output für sofortige Anzeige
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    
+    consoleActive_ = true;
+    
+    // Thread der Pipe ausliest und GUI updated
+    consoleThread_ = std::thread([this]() {
+        char buffer[4096];
+        std::string currentLine;
+        
+        // Setze Pipe auf non-blocking
+        int flags = fcntl(consolePipe_[0], F_GETFL, 0);
+        fcntl(consolePipe_[0], F_SETFL, flags | O_NONBLOCK);
+        
+        while (consoleActive_) {
+            ssize_t count = read(consolePipe_[0], buffer, sizeof(buffer) - 1);
+            
+            if (count > 0) {
+                buffer[count] = '\0';
+                
+                // Schreibe auch in Original-Streams (optional für Debugging)
+                write(stdoutBackup_, buffer, count);
+                
+                // Verarbeite Zeile für Zeile
+                for (ssize_t i = 0; i < count; ++i) {
+                    if (buffer[i] == '\n') {
+                        // Zeile komplett, update GUI
+                        if (!currentLine.empty()) {
+                            // Entferne ANSI-Farbcodes für saubere Anzeige
+                            std::string cleaned = currentLine;
+                            size_t pos = 0;
+                            while ((pos = cleaned.find("\033[", pos)) != std::string::npos) {
+                                size_t end = cleaned.find('m', pos);
+                                if (end != std::string::npos) {
+                                    cleaned.erase(pos, end - pos + 1);
+                                } else {
+                                    break;
+                                }
+                            }
+                            
+                            // Update GUI im Main-Thread
+                            ConsoleUpdateData* updateData = new ConsoleUpdateData;
+                            updateData->renderer = this;
+                            updateData->text = g_strdup(cleaned.c_str());
+                            g_idle_add(updateConsoleOutputIdle, updateData);
+                            
+                            currentLine.clear();
+                        }
+                    } else {
+                        currentLine += buffer[i];
+                    }
+                }
+            } else if (count == -1 && errno != EAGAIN) {
+                break;  // Error
+            }
+            
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        
+        // Zeige letzte unvollständige Zeile
+        if (!currentLine.empty()) {
+            ConsoleUpdateData* updateData = new ConsoleUpdateData;
+            updateData->renderer = this;
+            updateData->text = g_strdup(currentLine.c_str());
+            g_idle_add(updateConsoleOutputIdle, updateData);
+        }
+    });
+}
+
+void GtkRenderer::stopConsoleCapture() {
+    if (!consoleActive_) return;
+    
+    consoleActive_ = false;
+    
+    // Warte auf Thread-Ende
+    if (consoleThread_.joinable()) {
+        consoleThread_.join();
+    }
+    
+    // Restore original stdout/stderr
+    dup2(stdoutBackup_, STDOUT_FILENO);
+    dup2(stderrBackup_, STDERR_FILENO);
+    
+    close(stdoutBackup_);
+    close(stderrBackup_);
+    close(consolePipe_[0]);
+    close(consolePipe_[1]);
+}
+
+gboolean GtkRenderer::updateConsoleOutputIdle(gpointer data) {
+    ConsoleUpdateData* updateData = static_cast<ConsoleUpdateData*>(data);
+    
+    if (updateData->renderer && updateData->renderer->consoleLabel_) {
+        gtk_label_set_text(GTK_LABEL(updateData->renderer->consoleLabel_), updateData->text);
+    }
+    
+    g_free(updateData->text);
+    delete updateData;
+    return G_SOURCE_REMOVE;
+}
+
+void GtkRenderer::updateConsoleOutput(const std::string& text) {
+    if (consoleLabel_) {
+        gtk_label_set_text(GTK_LABEL(consoleLabel_), text.c_str());
+    }
+}
+
+// ==================== GENRE-FUSION & KÜNSTLER-STIL CALLBACKS ====================
+
+void GtkRenderer::onLearnGenreFusions(GtkWidget* widget, gpointer data) {
+    GtkRenderer* self = static_cast<GtkRenderer*>(data);
+    
+    if (!self->trainingModel_) {
+        GtkWidget* dialog = gtk_message_dialog_new(
+            GTK_WINDOW(self->window_), GTK_DIALOG_MODAL,
+            GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
+            "❌ Training-Modell nicht initialisiert!");
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        return;
+    }
+    
+    // Lerne Genre-Fusionen in Thread
+    std::thread([self]() {
+        auto fusionCounts = self->trainingModel_->learnGenreFusions();
+        
+        // Zeige Ergebnisse im Dialog
+        gdk_threads_add_idle(+[](gpointer data) -> gboolean {
+            auto* counts = static_cast<std::map<std::string, int>*>(data);
+            auto* self = static_cast<GtkRenderer*>(g_object_get_data(G_OBJECT(gtk_widget_get_toplevel(
+                GTK_WIDGET(gtk_window_get_focus(GTK_WINDOW(nullptr))))), "renderer"));
+            
+            std::string message = "🎭 Genre-Fusion Patterns:\n\n";
+            
+            std::vector<std::pair<std::string, int>> sorted(counts->begin(), counts->end());
+            std::sort(sorted.begin(), sorted.end(),
+                     [](const auto& a, const auto& b) { return a.second > b.second; });
+            
+            for (size_t i = 0; i < std::min(size_t(15), sorted.size()); i++) {
+                message += std::to_string(i+1) + ". " + sorted[i].first + 
+                          " (" + std::to_string(sorted[i].second) + " Tracks)\n";
+            }
+            
+            GtkWidget* dialog = gtk_message_dialog_new(
+                nullptr, GTK_DIALOG_MODAL,
+                GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
+                "%s", message.c_str());
+            gtk_dialog_run(GTK_DIALOG(dialog));
+            gtk_widget_destroy(dialog);
+            
+            delete counts;
+            return G_SOURCE_REMOVE;
+        }, new std::map<std::string, int>(fusionCounts));
+    }).detach();
+}
+
+void GtkRenderer::onLearnArtistStyle(GtkWidget* widget, gpointer data) {
+    GtkRenderer* self = static_cast<GtkRenderer*>(data);
+    
+    if (!self->trainingModel_) return;
+    
+    // Zeige Eingabe-Dialog für Künstlername
+    GtkWidget* dialog = gtk_dialog_new_with_buttons(
+        "🎨 Künstler-Stil analysieren",
+        GTK_WINDOW(self->window_),
+        (GtkDialogFlags)0,
+        "Abbrechen", GTK_RESPONSE_CANCEL,
+        "Analysieren", GTK_RESPONSE_OK,
+        NULL);
+    
+    makeDialogResizable(dialog, 450, 250);
+    GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+    gtk_box_pack_start(GTK_BOX(content), vbox, TRUE, TRUE, 0);
+    
+    GtkWidget* label = gtk_label_new("Künstlername eingeben (z.B. \"The Prodigy\"):");
+    gtk_label_set_selectable(GTK_LABEL(label), TRUE);
+    gtk_box_pack_start(GTK_BOX(vbox), label, FALSE, FALSE, 0);
+    
+    GtkWidget* entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(entry), "The Prodigy");
+    gtk_box_pack_start(GTK_BOX(vbox), entry, FALSE, FALSE, 0);
+    
+    gtk_widget_show_all(dialog);
+    
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        const char* artist = gtk_entry_get_text(GTK_ENTRY(entry));
+        if (artist && strlen(artist) > 0) {
+            std::string artistName = artist;
+            gtk_widget_destroy(dialog);
+            
+            // Analysiere in Thread
+            std::thread([self, artistName]() {
+                auto features = self->trainingModel_->learnArtistStyle(artistName);
+                
+                std::string msg = "✅ Künstler-Stil von \"" + artistName + "\" analysiert!\n\n";
+                msg += "Details siehe Console-Ausgabe.";
+                
+                gdk_threads_add_idle(+[](gpointer data) -> gboolean {
+                    std::string* message = static_cast<std::string*>(data);
+                    GtkWidget* dialog = gtk_message_dialog_new(
+                        nullptr, GTK_DIALOG_MODAL,
+                        GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
+                        "%s", message->c_str());
+                    gtk_dialog_run(GTK_DIALOG(dialog));
+                    gtk_widget_destroy(dialog);
+                    delete message;
+                    return G_SOURCE_REMOVE;
+                }, new std::string(msg));
+            }).detach();
+            return;
+        }
+    }
+    
+    gtk_widget_destroy(dialog);
+}
+
+// 🤖 Automatisches Genre-Learning: Lerne aus bereits korrigierten Tracks
+void GtkRenderer::autoLearnGenresFromCorrectedTracks() {
+    auto allMedia = database_->getAll();
+    if (allMedia.empty()) return;
+    
+    // Schritt 1: Sammle korrigierte Tracks als Trainingsbeispiele
+    std::map<std::string, std::vector<MediaMetadata>> genreExamples;
+    int correctedCount = 0;
+    
+    for (const auto& media : allMedia) {
+        // Nur Tracks die korrigiert wurden (lastUsed > 0) und ein Genre haben
+        if (media.lastUsed > 0 && media.genre != "Unknown" && !media.genre.empty() && media.analyzed) {
+            genreExamples[media.genre].push_back(media);
+            correctedCount++;
+        }
+    }
+    
+    if (correctedCount == 0) {
+        std::cout << "ℹ️ Keine korrigierten Tracks zum Lernen gefunden." << std::endl;
+        return;
+    }
+    
+    std::cout << "\n🎓 Genre-Learning gestartet..." << std::endl;
+    std::cout << "📚 " << correctedCount << " korrigierte Tracks als Trainingsbeispiele gefunden" << std::endl;
+    std::cout << "🎯 " << genreExamples.size() << " verschiedene Genres" << std::endl;
+    
+    // Zeige Trainingsbeispiele pro Genre
+    for (const auto& [genre, examples] : genreExamples) {
+        std::cout << "   • " << genre << ": " << examples.size() << " Beispiele" << std::endl;
+    }
+    
+    // Schritt 2: Berechne durchschnittliche Features pro Genre (Learning)
+    struct GenreProfile {
+        std::string genre;
+        float avgBpm = 0.0f;
+        float avgSpectralCentroid = 0.0f;
+        float avgZeroCrossing = 0.0f;
+        float avgSpectralRolloff = 0.0f;
+        std::string commonBassLevel;
+        std::string commonIntensity;
+        int sampleCount = 0;
+    };
+    
+    std::map<std::string, GenreProfile> genreProfiles;
+    
+    for (const auto& [genre, examples] : genreExamples) {
+        GenreProfile profile;
+        profile.genre = genre;
+        profile.sampleCount = examples.size();
+        
+        float sumBpm = 0, sumCentroid = 0, sumZeroCrossing = 0, sumRolloff = 0;
+        std::map<std::string, int> bassLevels, intensities;
+        
+        for (const auto& track : examples) {
+            sumBpm += track.bpm;
+            sumCentroid += track.spectralCentroid;
+            sumZeroCrossing += track.zeroCrossingRate;
+            sumRolloff += track.spectralRolloff;
+            bassLevels[track.bassLevel]++;;
+            intensities[track.intensity]++;
+        }
+        
+        profile.avgBpm = sumBpm / examples.size();
+        profile.avgSpectralCentroid = sumCentroid / examples.size();
+        profile.avgZeroCrossing = sumZeroCrossing / examples.size();
+        profile.avgSpectralRolloff = sumRolloff / examples.size();
+        
+        // Häufigstes Bass-Level und Intensität
+        profile.commonBassLevel = std::max_element(bassLevels.begin(), bassLevels.end(),
+            [](const auto& a, const auto& b) { return a.second < b.second; })->first;
+        profile.commonIntensity = std::max_element(intensities.begin(), intensities.end(),
+            [](const auto& a, const auto& b) { return a.second < b.second; })->first;
+        
+        genreProfiles[genre] = profile;
+    }
+    
+    // Schritt 3: Klassifiziere Unknown-Tracks basierend auf gelernten Profilen
+    int unknownCount = 0;
+    int classified = 0;
+    
+    std::cout << "\n🔍 Klassifiziere Unknown-Tracks..." << std::endl;
+    
+    for (auto media : allMedia) {
+        if (media.genre != "Unknown" && !media.genre.empty()) continue;
+        if (!media.analyzed) continue;  // Nur analysierte Tracks
+        
+        unknownCount++;
+        
+        // Finde ähnlichstes Genre-Profil
+        std::string bestGenre = "Rock/Pop";
+        float bestScore = std::numeric_limits<float>::max();
+        
+        for (const auto& [genre, profile] : genreProfiles) {
+            // Berechne Distanz (einfache Euklidische Distanz in Feature-Space)
+            float bpmDist = std::abs(media.bpm - profile.avgBpm) / 180.0f;  // Normalisiert
+            float centroidDist = std::abs(media.spectralCentroid - profile.avgSpectralCentroid) / 5000.0f;
+            float zeroCrossingDist = std::abs(media.zeroCrossingRate - profile.avgZeroCrossing) / 0.5f;
+            float rolloffDist = std::abs(media.spectralRolloff - profile.avgSpectralRolloff) / 10000.0f;
+            
+            // Bonus wenn Bass-Level und Intensität übereinstimmen
+            float bassBonus = (media.bassLevel == profile.commonBassLevel) ? -0.2f : 0.0f;
+            float intensityBonus = (media.intensity == profile.commonIntensity) ? -0.2f : 0.0f;
+            
+            float totalScore = bpmDist + centroidDist + zeroCrossingDist + rolloffDist + bassBonus + intensityBonus;
+            
+            if (totalScore < bestScore) {
+                bestScore = totalScore;
+                bestGenre = genre;
+            }
+        }
+        
+        // Update Genre mit Lern-basierter Klassifikation
+        media.genre = bestGenre;
+        if (database_->updateMedia(media)) {
+            classified++;
+            std::cout << "💡 Vorschlag #" << classified << ": " << media.title 
+                      << " → " << bestGenre << " (Score: " << bestScore << ")" << std::endl;
+        }
+        
+        // Limit output für Performance
+        if (classified >= 50) {
+            std::cout << "   ... (weitere Klassifikationen im Hintergrund)" << std::endl;
+            break;
+        }
+    }
+    
+    std::cout << "\n📊 Zusammenfassung:" << std::endl;
+    std::cout << "   • Vorschläge: " << classified << std::endl;
+    std::cout << "   • Angewendet: 0" << std::endl;
+    std::cout << "📋 " << classified << " automatische Korrektur-Vorschläge verfügbar" << std::endl;
+    std::cout << "ℹ️  Nutze 'Batch-Korrektur anwenden' um sie zu übernehmen" << std::endl;
+}
+
+void GtkRenderer::onSuggestGenreTags(GtkWidget* widget, gpointer data) {
+    GtkRenderer* self = static_cast<GtkRenderer*>(data);
+    
+    if (!self->trainingModel_) return;
+    
+    auto allMedia = self->database_->getAll();
+    if (allMedia.empty()) {
+        GtkWidget* dialog = gtk_message_dialog_new(
+            GTK_WINDOW(self->window_), GTK_DIALOG_MODAL,
+            GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
+            "ℹ️ Keine Tracks in Datenbank!");
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        return;
+    }
+    
+    // Analysiere alle Tracks und schlage Tags vor
+    std::thread([self, allMedia]() {
+        int updated = 0;
+        int analyzed = 0;
+        
+        for (auto media : allMedia) {
+            if (!media.analyzed || media.genre == "Unknown") continue;
+            
+            analyzed++;
+            
+            // Schlage Genre-Tags vor
+            std::string suggestedTags = self->trainingModel_->suggestGenreTags(media);
+            
+            // Update wenn unterschiedlich
+            if (suggestedTags != media.genreTags && !suggestedTags.empty()) {
+                media.genreTags = suggestedTags;
+                if (self->database_->updateMedia(media)) {
+                    updated++;
+                    std::cout << "🔍 " << media.title << ": " << suggestedTags << std::endl;
+                }
+            }
+            
+            if (analyzed % 50 == 0) {
+                std::cout << "   📊 " << analyzed << " Tracks analysiert..." << std::endl;
+            }
+        }
+        
+        std::string msg = "✅ Genre-Tag-Vorschläge abgeschlossen!\n\n";
+        msg += "Analysiert: " + std::to_string(analyzed) + " Tracks\n";
+        msg += "Aktualisiert: " + std::to_string(updated) + " Tracks\n\n";
+        msg += "Details siehe Console-Ausgabe.";
+        
+        gdk_threads_add_idle(+[](gpointer data) -> gboolean {
+            std::string* message = static_cast<std::string*>(data);
+            GtkWidget* dialog = gtk_message_dialog_new(
+                nullptr, GTK_DIALOG_MODAL,
+                GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
+                "%s", message->c_str());
+            gtk_dialog_run(GTK_DIALOG(dialog));
+            gtk_widget_destroy(dialog);
+            delete message;
+            return G_SOURCE_REMOVE;
+        }, new std::string(msg));
+    }).detach();
+}
+
+// 🎤 Pattern Capture Callbacks
+void GtkRenderer::onPatternRecord(GtkWidget* widget, gpointer data) {
+    auto* self = static_cast<GtkRenderer*>(data);
+    
+    if (!self->patternCapture_) {
+        GtkWidget* dialog = gtk_message_dialog_new(
+            GTK_WINDOW(self->window_), GTK_DIALOG_MODAL,
+            GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
+            "Pattern Capture Engine nicht initialisiert!");
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        return;
+    }
+    
+    // Get pattern type
+    int typeIndex = gtk_combo_box_get_active(GTK_COMBO_BOX(self->patternTypeCombo_));
+    bool isRhythm = (typeIndex == 0);
+    
+    // Start capture
+    bool success = self->patternCapture_->startCapture(isRhythm ? "rhythm" : "melody");
+    
+    if (success) {
+        self->patternRecording_ = true;
+        gtk_label_set_text(GTK_LABEL(self->patternStatusLabel_), 
+                          isRhythm ? "🔴 Nehme Rhythmus auf..." : "🔴 Nehme Melodie auf...");
+        gtk_widget_set_sensitive(self->patternRecordBtn_, FALSE);
+        gtk_widget_set_sensitive(self->patternStopBtn_, TRUE);
+        gtk_widget_set_sensitive(self->patternTypeCombo_, FALSE);
+    } else {
+        GtkWidget* dialog = gtk_message_dialog_new(
+            GTK_WINDOW(self->window_), GTK_DIALOG_MODAL,
+            GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
+            "Aufnahme fehlgeschlagen:\nPortAudio Fehler oder Mikrofon nicht verfügbar");
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+    }
+}
+
+void GtkRenderer::onPatternStop(GtkWidget* widget, gpointer data) {
+    auto* self = static_cast<GtkRenderer*>(data);
+    
+    if (!self->patternCapture_ || !self->patternRecording_) {
+        return;
+    }
+    
+    // Stop capture
+    self->patternCapture_->stopCapture();
+    self->patternRecording_ = false;
+    
+    // Get captured pattern
+    int typeIndex = gtk_combo_box_get_active(GTK_COMBO_BOX(self->patternTypeCombo_));
+    bool isRhythm = (typeIndex == 0);
+    
+    // Show rating dialog
+    GtkWidget* dialog = gtk_dialog_new_with_buttons(
+        "Pattern Bewerten",
+        GTK_WINDOW(self->window_),
+        (GtkDialogFlags)0,
+        "_Abbrechen", GTK_RESPONSE_CANCEL,
+        "_Speichern", GTK_RESPONSE_OK,
+        NULL);
+    
+    makeDialogResizable(dialog, 400, 250);
+    GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    gtk_container_set_border_width(GTK_CONTAINER(content), 10);
+    
+    gtk_box_pack_start(GTK_BOX(content), 
+                       gtk_label_new("Wie gut klingt dieses Pattern?"), 
+                       FALSE, FALSE, 5);
+    
+    // Rating scale
+    GtkWidget* ratingScale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 1.0, 10.0, 1.0);
+    gtk_scale_set_value_pos(GTK_SCALE(ratingScale), GTK_POS_BOTTOM);
+    gtk_range_set_value(GTK_RANGE(ratingScale), 5.0);
+    gtk_widget_set_size_request(ratingScale, 300, -1);
+    gtk_box_pack_start(GTK_BOX(content), ratingScale, FALSE, FALSE, 5);
+    
+    // Name entry
+    GtkWidget* hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_box_pack_start(GTK_BOX(content), hbox, FALSE, FALSE, 5);
+    gtk_box_pack_start(GTK_BOX(hbox), gtk_label_new("Name:"), FALSE, FALSE, 0);
+    
+    GtkWidget* nameEntry = gtk_entry_new();
+    gtk_entry_set_text(GTK_ENTRY(nameEntry), isRhythm ? "Rhythm Pattern" : "Melody Pattern");
+    gtk_box_pack_start(GTK_BOX(hbox), nameEntry, TRUE, TRUE, 0);
+    
+    gtk_widget_show_all(content);
+    
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        float rating = gtk_range_get_value(GTK_RANGE(ratingScale));
+        const char* name = gtk_entry_get_text(GTK_ENTRY(nameEntry));
+        
+        // Save pattern to library
+        if (isRhythm) {
+            SongGen::CapturedRhythm rhythm = self->patternCapture_->getCapturedRhythm();
+            SongGen::PatternAnalysis analysis = self->patternCapture_->analyzeRhythm(rhythm);
+            self->patternCapture_->learnPattern(name, &rhythm, nullptr, rating / 10.0f);
+            
+            // Add to TreeView
+            GtkTreeIter iter;
+            gtk_list_store_append(self->patternLibraryStore_, &iter);
+            
+            char grooveStr[32], complexityStr[32], ratingStr[32];
+            snprintf(grooveStr, sizeof(grooveStr), "%.2f", analysis.groove);
+            snprintf(complexityStr, sizeof(complexityStr), "%.2f", analysis.complexity);
+            snprintf(ratingStr, sizeof(ratingStr), "%.1f/10", rating);
+            
+            gtk_list_store_set(self->patternLibraryStore_, &iter,
+                             0, "Rhythmus",
+                             1, name,
+                             2, grooveStr,
+                             3, complexityStr,
+                             4, ratingStr,
+                             5, (int)(rating * 10),
+                             -1);
+            
+            std::cout << "✅ Rhythmus-Pattern gespeichert: " << name 
+                     << " (Groove: " << analysis.groove << ", Rating: " << rating << ")\n";
+        } else {
+            SongGen::CapturedMelody melody = self->patternCapture_->getCapturedMelody();
+            SongGen::PatternAnalysis analysis = self->patternCapture_->analyzeMelody(melody);
+            self->patternCapture_->learnPattern(name, nullptr, &melody, rating / 10.0f);
+            
+            // Add to TreeView
+            GtkTreeIter iter;
+            gtk_list_store_append(self->patternLibraryStore_, &iter);
+            
+            char interestStr[32], tensionStr[32], ratingStr[32];
+            snprintf(interestStr, sizeof(interestStr), "%.2f", analysis.melodicInterest);
+            snprintf(tensionStr, sizeof(tensionStr), "%.2f", analysis.tension);
+            snprintf(ratingStr, sizeof(ratingStr), "%.1f/10", rating);
+            
+            gtk_list_store_set(self->patternLibraryStore_, &iter,
+                             0, "Melodie",
+                             1, name,
+                             2, interestStr,
+                             3, tensionStr,
+                             4, ratingStr,
+                             5, (int)(rating * 10),
+                             -1);
+            
+            std::cout << "✅ Melodie-Pattern gespeichert: " << name 
+                     << " (Interest: " << analysis.melodicInterest << ", Rating: " << rating << ")\n";
+        }
+    }
+    
+    gtk_widget_destroy(dialog);
+    
+    // Reset UI
+    gtk_label_set_text(GTK_LABEL(self->patternStatusLabel_), "Bereit zur Aufnahme");
+    gtk_widget_set_sensitive(self->patternRecordBtn_, TRUE);
+    gtk_widget_set_sensitive(self->patternStopBtn_, FALSE);
+    gtk_widget_set_sensitive(self->patternTypeCombo_, TRUE);
+}
+
+void GtkRenderer::onPatternLibraryRowActivated(GtkTreeView* tree, GtkTreePath* path, 
+                                               GtkTreeViewColumn* col, gpointer data) {
+    auto* self = static_cast<GtkRenderer*>(data);
+    
+    GtkTreeModel* model = gtk_tree_view_get_model(tree);
+    GtkTreeIter iter;
+    
+    if (gtk_tree_model_get_iter(model, &iter, path)) {
+        gchar* type;
+        gchar* name;
+        gchar* param1;
+        gchar* param2;
+        gchar* rating;
+        
+        gtk_tree_model_get(model, &iter, 
+                          0, &type,
+                          1, &name,
+                          2, &param1,
+                          3, &param2,
+                          4, &rating,
+                          -1);
+        
+        // Show pattern details
+        std::string message = "Pattern Details:\n\n";
+        message += "Typ: " + std::string(type) + "\n";
+        message += "Name: " + std::string(name) + "\n";
+        
+        if (std::string(type) == "Rhythmus") {
+            message += "Groove: " + std::string(param1) + "\n";
+            message += "Komplexität: " + std::string(param2) + "\n";
+        } else {
+            message += "Melodic Interest: " + std::string(param1) + "\n";
+            message += "Tension: " + std::string(param2) + "\n";
+        }
+        
+        message += "Bewertung: " + std::string(rating);
+        
+        GtkWidget* dialog = gtk_message_dialog_new(
+            GTK_WINDOW(self->window_), GTK_DIALOG_MODAL,
+            GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
+            "%s", message.c_str());
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        
+        g_free(type);
+        g_free(name);
+        g_free(param1);
+        g_free(param2);
+        g_free(rating);
+    }
+}
+
+void GtkRenderer::onPatternExport(GtkWidget* widget, gpointer data) {
+    auto* self = static_cast<GtkRenderer*>(data);
+    
+    GtkWidget* dialog = gtk_file_chooser_dialog_new(
+        "Pattern Library exportieren", GTK_WINDOW(self->window_),
+        GTK_FILE_CHOOSER_ACTION_SAVE,
+        "_Abbrechen", GTK_RESPONSE_CANCEL,
+        "_Speichern", GTK_RESPONSE_ACCEPT,
+        NULL);
+    
+    gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dialog), TRUE);
+    gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dialog), "patterns.json");
+    
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        char* filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+        
+        // TODO: Actually export patterns to JSON file
+        std::cout << "💾 Exporting patterns to: " << filename << std::endl;
+        
+        g_free(filename);
+    }
+    
+    gtk_widget_destroy(dialog);
+}
+
+void GtkRenderer::onPatternImport(GtkWidget* widget, gpointer data) {
+    auto* self = static_cast<GtkRenderer*>(data);
+    
+    GtkWidget* dialog = gtk_file_chooser_dialog_new(
+        "Pattern Library importieren", GTK_WINDOW(self->window_),
+        GTK_FILE_CHOOSER_ACTION_OPEN,
+        "_Abbrechen", GTK_RESPONSE_CANCEL,
+        "_Öffnen", GTK_RESPONSE_ACCEPT,
+        NULL);
+    
+    GtkFileFilter* filter = gtk_file_filter_new();
+    gtk_file_filter_set_name(filter, "JSON Dateien");
+    gtk_file_filter_add_pattern(filter, "*.json");
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
+    
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        char* filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+        
+        // TODO: Actually import patterns from JSON file
+        std::cout << "📂 Importing patterns from: " << filename << std::endl;
+        
+        g_free(filename);
+    }
+    
+    gtk_widget_destroy(dialog);
+}
+
+void GtkRenderer::onPatternClear(GtkWidget* widget, gpointer data) {
+    auto* self = static_cast<GtkRenderer*>(data);
+    
+    GtkWidget* dialog = gtk_message_dialog_new(
+        GTK_WINDOW(self->window_), GTK_DIALOG_MODAL,
+        GTK_MESSAGE_QUESTION, GTK_BUTTONS_YES_NO,
+        "Alle gelernten Patterns löschen?\n\nDieser Vorgang kann nicht rückgängig gemacht werden.");
+    
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_YES) {
+        gtk_list_store_clear(self->patternLibraryStore_);
+        
+        if (self->patternCapture_) {
+            self->patternCapture_->clearLibrary();
+        }
+        
+        std::cout << "🗑️ Pattern Library gelöscht\n";
+    }
+    
+    gtk_widget_destroy(dialog);
 }

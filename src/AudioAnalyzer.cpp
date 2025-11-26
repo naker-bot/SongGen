@@ -129,10 +129,24 @@ bool AudioAnalyzer::analyze(const std::string& filepath, MediaMetadata& meta) {
     std::string musicalStyle = detectMusicalStyle(meta);
     auto styleTags = extractStyleTags(meta);
     
-    // Speichere erweiterte Info im mood-Feld
-    meta.mood = rhythmPattern + " | " + musicalStyle;
-    for (const auto& tag : styleTags) {
-        meta.mood += " #" + tag;
+    // 🎵 Song-Struktur-Analyse (nur wenn BPM erkannt wurde)
+    if (meta.bpm > 0) {
+        auto structure = analyzeSongStructure(samples, sampleRate, meta.bpm);
+        
+        // Speichere Struktur-Info im mood-Feld zusammen mit Style-Info
+        meta.mood = rhythmPattern + " | " + musicalStyle + " | " + structure.arrangement;
+        meta.mood += " [" + std::to_string(structure.numVariations) + " parts, ";
+        meta.mood += std::to_string((int)(structure.complexityScore * 100)) + "% complex]";
+        
+        for (const auto& tag : styleTags) {
+            meta.mood += " #" + tag;
+        }
+    } else {
+        // Fallback ohne Struktur-Analyse
+        meta.mood = rhythmPattern + " | " + musicalStyle;
+        for (const auto& tag : styleTags) {
+            meta.mood += " #" + tag;
+        }
     }
     
     meta.analyzed = true;
@@ -1203,4 +1217,258 @@ bool AudioAnalyzer::repairClipping(const std::string& inputPath, const std::stri
     out.close();
     return true;
     #endif
+}
+
+// 🎵 Song-Struktur-Analyse - Erkennt Intro, Verse, Chorus, Bridge etc.
+AudioAnalyzer::SongStructure AudioAnalyzer::analyzeSongStructure(
+    const std::vector<float>& samples, 
+    int sampleRate, 
+    float bpm
+) {
+    SongStructure structure;
+    structure.totalDuration = (float)samples.size() / sampleRate;
+    structure.numVariations = 0;
+    structure.complexityScore = 0.0f;
+    
+    if (samples.empty() || sampleRate <= 0) {
+        return structure;
+    }
+    
+    // 1. Segmentiere Song in ~4-Sekunden-Abschnitte basierend auf BPM
+    float beatsPerSecond = bpm / 60.0f;
+    float secondsPerBar = 4.0f / beatsPerSecond;  // 4/4 Takt
+    int samplesPerSegment = (int)(secondsPerBar * 4.0f * sampleRate);  // 4 Takte = typische Phrase
+    
+    std::cout << "🎵 [Structure] Analysiere " << structure.totalDuration << "s Song bei " 
+              << bpm << " BPM (Segment: " << (samplesPerSegment / sampleRate) << "s)\n";
+    
+    // 2. Berechne Features für jedes Segment
+    struct SegmentFeatures {
+        float startTime;
+        float endTime;
+        float energy;           // RMS
+        float spectralCentroid; // Helligkeit
+        float spectralFlux;     // Veränderung
+        float zeroCrossing;     // Noise-Level
+        int numOnsets;          // Rhythmische Dichte
+        std::vector<float> spectrum;
+    };
+    
+    std::vector<SegmentFeatures> segments;
+    
+    for (size_t i = 0; i < samples.size(); i += samplesPerSegment) {
+        size_t end = std::min(i + samplesPerSegment, samples.size());
+        std::vector<float> segment(samples.begin() + i, samples.begin() + end);
+        
+        SegmentFeatures feat;
+        feat.startTime = (float)i / sampleRate;
+        feat.endTime = (float)end / sampleRate;
+        
+        // Energy (RMS)
+        float sumSquares = 0.0f;
+        for (float s : segment) sumSquares += s * s;
+        feat.energy = std::sqrt(sumSquares / segment.size());
+        
+        // Zero Crossing Rate
+        feat.zeroCrossing = calculateZeroCrossingRate(segment);
+        
+        // Spectral Features
+        auto fft = performFFT(segment);
+        feat.spectrum.resize(fft.size());
+        for (size_t j = 0; j < fft.size(); ++j) {
+            feat.spectrum[j] = std::abs(fft[j]);
+        }
+        feat.spectralCentroid = calculateSpectralCentroid(fft);
+        
+        // Onset Detection (vereinfacht)
+        feat.numOnsets = 0;
+        float prevEnergy = 0.0f;
+        int windowSize = sampleRate / 20;  // 50ms windows
+        for (size_t j = 0; j < segment.size(); j += windowSize) {
+            size_t wEnd = std::min(j + windowSize, segment.size());
+            float windowEnergy = 0.0f;
+            for (size_t k = j; k < wEnd; ++k) {
+                windowEnergy += segment[k] * segment[k];
+            }
+            windowEnergy /= (wEnd - j);
+            
+            if (windowEnergy > prevEnergy * 1.5f && windowEnergy > 0.01f) {
+                feat.numOnsets++;
+            }
+            prevEnergy = windowEnergy;
+        }
+        
+        segments.push_back(feat);
+    }
+    
+    if (segments.empty()) return structure;
+    
+    std::cout << "   📊 " << segments.size() << " Segmente analysiert\n";
+    
+    // 3. Berechne Spectral Flux (Veränderung zwischen Segmenten)
+    for (size_t i = 1; i < segments.size(); ++i) {
+        float flux = 0.0f;
+        size_t minSize = std::min(segments[i].spectrum.size(), segments[i-1].spectrum.size());
+        for (size_t j = 0; j < minSize; ++j) {
+            float diff = segments[i].spectrum[j] - segments[i-1].spectrum[j];
+            flux += diff * diff;
+        }
+        segments[i].spectralFlux = std::sqrt(flux / minSize);
+    }
+    segments[0].spectralFlux = 0.0f;
+    
+    // 4. Finde Grenzen zwischen Sections (hoher Spectral Flux = Strukturwechsel)
+    std::vector<int> boundaries;
+    boundaries.push_back(0);  // Start
+    
+    // Normalisiere Flux für Threshold
+    float avgFlux = 0.0f;
+    for (const auto& seg : segments) avgFlux += seg.spectralFlux;
+    avgFlux /= segments.size();
+    
+    for (size_t i = 2; i < segments.size() - 2; ++i) {
+        if (segments[i].spectralFlux > avgFlux * 1.8f) {
+            // Verhindere zu nahe Boundaries (min. 2 Segmente = 8 Sekunden)
+            if (boundaries.empty() || (i - boundaries.back()) >= 2) {
+                boundaries.push_back(i);
+            }
+        }
+    }
+    boundaries.push_back(segments.size() - 1);  // End
+    
+    std::cout << "   🎯 " << boundaries.size() << " Strukturgrenzen erkannt\n";
+    
+    // 5. Klassifiziere Sections
+    std::map<std::string, int> seenSections;  // Für Repetitions-Index
+    
+    for (size_t b = 0; b < boundaries.size() - 1; ++b) {
+        int startIdx = boundaries[b];
+        int endIdx = boundaries[b + 1];
+        
+        SongSection section;
+        section.startTime = segments[startIdx].startTime;
+        section.endTime = segments[endIdx].endTime;
+        
+        // Durchschnitts-Features für diese Section
+        float avgEnergy = 0.0f;
+        float avgCentroid = 0.0f;
+        float avgOnsets = 0.0f;
+        
+        for (int i = startIdx; i <= endIdx && i < (int)segments.size(); ++i) {
+            avgEnergy += segments[i].energy;
+            avgCentroid += segments[i].spectralCentroid;
+            avgOnsets += segments[i].numOnsets;
+        }
+        int count = endIdx - startIdx + 1;
+        avgEnergy /= count;
+        avgCentroid /= count;
+        avgOnsets /= count;
+        
+        section.energy = avgEnergy;
+        section.spectralChange = (startIdx < (int)segments.size()) ? segments[startIdx].spectralFlux : 0.0f;
+        section.hasVocals = false;  // TODO: Vocal detection
+        
+        // Klassifiziere basierend auf Position, Energy und Features
+        float relativePos = section.startTime / structure.totalDuration;
+        
+        if (relativePos < 0.15f) {
+            // Erste 15% = wahrscheinlich Intro
+            section.type = "intro";
+        } else if (relativePos > 0.85f) {
+            // Letzte 15% = wahrscheinlich Outro
+            section.type = "outro";
+        } else if (avgEnergy > 0.15f && avgOnsets > 15) {
+            // Hohe Energy + viele Onsets = Chorus
+            section.type = "chorus";
+        } else if (avgEnergy < 0.08f && avgOnsets < 8) {
+            // Niedrige Energy = Break/Bridge
+            section.type = (relativePos > 0.5f) ? "bridge" : "break";
+        } else {
+            // Standard = Verse
+            section.type = "verse";
+        }
+        
+        // Repetitions-Index
+        section.repetitionIndex = seenSections[section.type];
+        seenSections[section.type]++;
+        
+        structure.sections.push_back(section);
+        structure.sectionCounts[section.type]++;
+    }
+    
+    // 6. Erzeuge Arrangement-String (z.B. "Intro-Verse-Chorus-Verse-Chorus-Bridge-Chorus-Outro")
+    structure.arrangement = "";
+    for (const auto& sec : structure.sections) {
+        if (!structure.arrangement.empty()) structure.arrangement += "-";
+        structure.arrangement += sec.type;
+        if (sec.repetitionIndex > 0) {
+            structure.arrangement += std::to_string(sec.repetitionIndex + 1);
+        }
+    }
+    
+    // 7. Berechne Komplexität (mehr verschiedene Sections = komplexer)
+    structure.numVariations = structure.sectionCounts.size();
+    structure.complexityScore = std::min(1.0f, structure.numVariations / 6.0f);  // 6 Types = max
+    
+    std::cout << "   ✅ Struktur: " << structure.arrangement << "\n";
+    std::cout << "      Variations: " << structure.numVariations 
+              << ", Complexity: " << (int)(structure.complexityScore * 100) << "%\n";
+    
+    for (const auto& [type, count] : structure.sectionCounts) {
+        std::cout << "      • " << type << ": " << count << "x\n";
+    }
+    
+    return structure;
+}
+
+// 🎓 Lerne Struktur-Pattern pro Genre
+void AudioAnalyzer::learnStructurePatterns(
+    const std::vector<SongStructure>& structures, 
+    const std::string& genre
+) {
+    if (structures.empty()) return;
+    
+    std::cout << "🎓 [Learning] Lerne Struktur-Patterns für " << genre 
+              << " (" << structures.size() << " Songs)\n";
+    
+    // 1. Häufigste Arrangements
+    std::map<std::string, int> arrangementCounts;
+    for (const auto& s : structures) {
+        arrangementCounts[s.arrangement]++;
+    }
+    
+    std::cout << "   📋 Top Arrangements:\n";
+    std::vector<std::pair<std::string, int>> sorted(arrangementCounts.begin(), arrangementCounts.end());
+    std::sort(sorted.begin(), sorted.end(), [](auto& a, auto& b) { return a.second > b.second; });
+    
+    for (size_t i = 0; i < std::min(size_t(5), sorted.size()); ++i) {
+        std::cout << "      " << (i+1) << ". " << sorted[i].first 
+                  << " (" << sorted[i].second << "x)\n";
+    }
+    
+    // 2. Durchschnittliche Section-Verteilung
+    std::map<std::string, std::vector<int>> sectionCountsPerSong;
+    for (const auto& s : structures) {
+        for (const auto& [type, count] : s.sectionCounts) {
+            sectionCountsPerSong[type].push_back(count);
+        }
+    }
+    
+    std::cout << "   📊 Durchschnittliche Section-Counts:\n";
+    for (const auto& [type, counts] : sectionCountsPerSong) {
+        float avg = 0.0f;
+        for (int c : counts) avg += c;
+        avg /= counts.size();
+        std::cout << "      • " << type << ": Ø " << std::fixed << std::setprecision(1) 
+                  << avg << "x\n";
+    }
+    
+    // 3. Durchschnittliche Komplexität
+    float avgComplexity = 0.0f;
+    for (const auto& s : structures) avgComplexity += s.complexityScore;
+    avgComplexity /= structures.size();
+    
+    std::cout << "   🎯 Genre-Komplexität: " << (int)(avgComplexity * 100) << "%\n";
+    
+    // TODO: Speichere gelerntes Pattern in Database oder Datei für späteren Genre-Generator
 }

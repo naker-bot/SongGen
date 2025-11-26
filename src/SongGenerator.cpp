@@ -23,6 +23,30 @@ SongGenerator::SongGenerator(MediaDatabase& db) : db_(db) {
     } else {
         std::cout << "ℹ️ Kein ML-Modell gefunden, nutze Synthese-Fallback" << std::endl;
     }
+    
+    // Initialisiere Instrument-Library
+    std::string libraryPath = std::string(getenv("HOME")) + "/.songgen/instruments";
+    instrumentLibrary_ = std::make_unique<InstrumentLibrary>(libraryPath);
+    instrumentLibrary_->loadDefaultModels();
+    
+    std::cout << "🎹 " << instrumentLibrary_->listModels().size() << " Instrument-Modelle geladen\n";
+    
+    // Initialize new AI music generation systems
+    chordEngine_ = std::make_unique<SongGen::ChordProgressionEngine>();
+    rhythmEngine_ = std::make_unique<SongGen::RhythmEngine>();
+    structureEngine_ = std::make_unique<SongGen::SongStructureEngine>();
+    mixMasterEngine_ = std::make_unique<SongGen::MixMasterEngine>();
+    bassEngine_ = std::make_unique<SongGen::BassLineEngine>();
+    midiExporter_ = std::make_unique<SongGen::MIDIExporter>();
+    patternEngine_ = std::make_unique<SongGen::PatternCaptureEngine>();
+    
+    // Load learned patterns library
+    std::string patternLibPath = std::string(getenv("HOME")) + "/.songgen/patterns.json";
+    if (patternEngine_->loadLibrary(patternLibPath)) {
+        std::cout << "🎤 Loaded " << patternEngine_->getAllPatterns().size() << " learned patterns\n";
+    }
+    
+    std::cout << "🎵 AI Music Generation Systems initialized\n";
 }
 
 SongGenerator::~SongGenerator() {
@@ -204,10 +228,48 @@ bool SongGenerator::generateMelody(const GenerationParams& params, std::vector<f
         }
     }
     
-    // Fallback: Genre-basierte Melodie-Generierung mit Tonleitern
-    std::cout << "🎵 Synthese-basierte Melodie (kein ML-Modell)" << std::endl;
+    // Fallback: Instrument-basierte Melodie-Generierung mit realistischen Klängen
+    std::cout << "🎵 Instrument-basierte Melodie-Synthese" << std::endl;
     
-    // Seed basierend auf Parametern für einzigartige aber reproduzierbare Melodien
+    // Check for learned melody patterns
+    auto learnedPatterns = patternEngine_->getAllPatterns();
+    std::vector<SongGen::LearnedPattern> melodyPatterns;
+    for (const auto& pattern : learnedPatterns) {
+        if (pattern.type == "melody" && pattern.userRating > 0.6f) {
+            melodyPatterns.push_back(pattern);
+        }
+    }
+    
+    if (!melodyPatterns.empty()) {
+        std::cout << "🎤 Using " << melodyPatterns.size() << " learned melody patterns!\n";
+    }
+    
+    if (!instrumentLibrary_) {
+        std::cerr << "❌ Instrument-Library nicht initialisiert!" << std::endl;
+        return false;
+    }
+    
+    // Wähle passendes Lead-Instrument basierend auf Genre
+    std::shared_ptr<InstrumentModel> leadInstrument;
+    
+    if (params.genre == "Trap" || params.genre == "Hip-Hop") {
+        leadInstrument = instrumentLibrary_->getModel("synth_lead");
+    } else if (params.genre == "Techno" || params.genre == "House" || params.genre == "Trance") {
+        leadInstrument = instrumentLibrary_->getModel("synth_lead");
+    } else if (params.genre == "Rock" || params.genre == "Metal" || params.genre == "New Metal") {
+        leadInstrument = instrumentLibrary_->getModel("guitar");
+    } else if (params.genre == "Pop") {
+        leadInstrument = instrumentLibrary_->getModel("piano");
+    } else {
+        leadInstrument = instrumentLibrary_->getModel("synth_lead");  // Default
+    }
+    
+    if (!leadInstrument) {
+        std::cerr << "❌ Lead-Instrument nicht gefunden!" << std::endl;
+        return false;
+    }
+    
+    // Seed basierend auf Parametern für reproduzierbare Melodien
     std::random_device rd;
     unsigned int seed = rd() ^ static_cast<unsigned int>(params.bpm * 1000) ^ 
                        static_cast<unsigned int>(params.energy * 1000) ^
@@ -216,28 +278,34 @@ bool SongGenerator::generateMelody(const GenerationParams& params, std::vector<f
     
     // Wähle Tonleiter basierend auf Genre
     std::vector<float> scale;
-    float rootNote = 440.0f * (0.8f + (params.energy * 0.4f));  // Variiere Root Note
+    float rootNote = 261.63f;  // C4 als Basis (statt wildem 440Hz)
     
-    if (params.genre == "Trap") {
-        // Moll-Pentatonik (dunkel)
+    if (params.genre == "Trap" || params.genre == "Hip-Hop") {
+        // Moll-Pentatonik (dunkel, typisch für Trap)
         scale = {rootNote, rootNote*1.2f, rootNote*1.33f, rootNote*1.5f, rootNote*1.78f};
-    } else if (params.genre == "Techno") {
-        // Techno: minimalistisch, repetitiv, tiefere Töne
-        scale = {rootNote*0.5f, rootNote*0.6f, rootNote*0.75f, rootNote*0.89f, rootNote};
+    } else if (params.genre == "Techno" || params.genre == "House") {
+        // Moll-Tonleiter, minimalistisch
+        scale = {rootNote, rootNote*1.122f, rootNote*1.189f, rootNote*1.33f, rootNote*1.5f};
     } else if (params.genre == "Pop" || params.genre == "Rock") {
-        // Dur-Tonleiter (fröhlich)
-        scale = {rootNote, rootNote*1.125f, rootNote*1.25f, rootNote*1.33f, 
-                 rootNote*1.5f, rootNote*1.67f, rootNote*1.875f};
-    } else if (params.genre == "Metal") {
-        // Phrygisch (Metal-typisch)
-        scale = {rootNote*0.5f, rootNote*0.53f, rootNote*0.6f, rootNote*0.67f, 
-                 rootNote*0.75f, rootNote*0.8f, rootNote*0.89f};
+        // Dur-Tonleiter (fröhlich, eingängig)
+        scale = {rootNote, rootNote*1.122f, rootNote*1.26f, rootNote*1.33f, 
+                 rootNote*1.498f, rootNote*1.682f, rootNote*1.888f, rootNote*2.0f};
+    } else if (params.genre == "Metal" || params.genre == "New Metal") {
+        // Phrygisch-dominant (Metal-typisch, tiefere Stimmung)
+        rootNote = 196.0f;  // G3 (tiefer für Metal)
+        scale = {rootNote, rootNote*1.059f, rootNote*1.26f, rootNote*1.33f, 
+                 rootNote*1.498f, rootNote*1.587f, rootNote*1.782f};
+    } else if (params.genre == "Jazz") {
+        // Jazz-Skala mit Blue Notes
+        scale = {rootNote, rootNote*1.122f, rootNote*1.189f, rootNote*1.26f,
+                 rootNote*1.33f, rootNote*1.498f, rootNote*1.682f, rootNote*1.782f};
     } else {
-        // Chromatisch
-        scale = {rootNote*0.5f, rootNote*0.6f, rootNote*0.75f, rootNote, rootNote*1.5f};
+        // Standard Dur
+        scale = {rootNote, rootNote*1.122f, rootNote*1.26f, rootNote*1.33f, 
+                 rootNote*1.498f, rootNote*1.682f, rootNote*1.888f};
     }
     
-    // Erstelle mehrere melodische Phrasen
+    // Erstelle musikalische Phrasen (keine wilden zufälligen Töne!)
     std::vector<std::vector<size_t>> phrases;
     std::uniform_int_distribution<size_t> noteDist(0, scale.size() - 1);
     
@@ -289,16 +357,15 @@ bool SongGenerator::generateMelody(const GenerationParams& params, std::vector<f
         
         size_t samplesPerNote = static_cast<size_t>(noteDuration * sampleRate);
         
-        std::vector<float> tone;
-        synthesizeTone(frequency, noteDuration, sampleRate, tone);
+        // ✨ Nutze Instrument-Modell für realistischen Klang!
+        float velocity = 0.6f + (params.energy * 0.3f) + (static_cast<float>(noteInPhrase) / 10.0f);
+        velocity = std::clamp(velocity, 0.3f, 1.0f);
         
-        // Dynamik: variiere Lautstärke
-        float baseLevel = 0.2f + (params.energy * 0.3f);
-        float dynamics = 0.8f + (static_cast<float>(noteInPhrase) / 8.0f);  // Leichte Betonung
-        float level = baseLevel * dynamics;
+        std::vector<float> tone = leadInstrument->synthesize(frequency, noteDuration, velocity, sampleRate);
         
+        // Mix in Main-Buffer
         for (size_t j = 0; j < tone.size() && (position + j) < samples.size(); ++j) {
-            samples[position + j] += tone[j] * level;
+            samples[position + j] += tone[j] * 0.5f;  // 50% Mix-Level für Lead
         }
         
         position += samplesPerNote;
@@ -309,6 +376,31 @@ bool SongGenerator::generateMelody(const GenerationParams& params, std::vector<f
 }
 
 bool SongGenerator::generateRhythm(const GenerationParams& params, std::vector<float>& samples) {
+    std::cout << "🥁 Generiere Rhythmus mit Drum-Modellen..." << std::endl;
+    
+    // Check for learned rhythm patterns
+    auto learnedPatterns = patternEngine_->getAllPatterns();
+    std::vector<SongGen::LearnedPattern> rhythmPatterns;
+    for (const auto& pattern : learnedPatterns) {
+        if (pattern.type == "rhythm" && pattern.userRating > 0.6f) {
+            rhythmPatterns.push_back(pattern);
+        }
+    }
+    
+    if (!rhythmPatterns.empty()) {
+        std::cout << "🎤 Using " << rhythmPatterns.size() << " learned rhythm patterns!\n";
+    }
+    
+    // Lade Drum-Instrumente
+    auto kickDrum = instrumentLibrary_->getModel("drum_kick");
+    auto snareDrum = instrumentLibrary_->getModel("drum_snare");
+    auto hihat = instrumentLibrary_->getModel("drum_hihat");
+    
+    if (!kickDrum || !snareDrum || !hihat) {
+        std::cerr << "❌ Drum-Modelle nicht gefunden!" << std::endl;
+        return false;
+    }
+    
     int sampleRate = 44100;
     float beatDuration = 60.0f / params.bpm;
     size_t samplesPerBeat = static_cast<size_t>(beatDuration * sampleRate);
@@ -318,6 +410,10 @@ bool SongGenerator::generateRhythm(const GenerationParams& params, std::vector<f
     unsigned int seed = rd() ^ static_cast<unsigned int>(params.bpm * 456);
     std::mt19937 rhythmGen(seed);
     std::uniform_int_distribution<int> fillDist(0, 100);
+    
+    // If we have learned patterns, use them occasionally
+    std::uniform_int_distribution<size_t> patternDist(0, rhythmPatterns.size() > 0 ? rhythmPatterns.size() - 1 : 0);
+    bool useLearnedPattern = !rhythmPatterns.empty() && (fillDist(rhythmGen) < 40);
     
     // Genre-spezifische Rhythmus-Pattern
     for (size_t beat = 0; beat * samplesPerBeat < samples.size(); ++beat) {
@@ -332,53 +428,44 @@ bool SongGenerator::generateRhythm(const GenerationParams& params, std::vector<f
         }
         
         if (playKick) {
-            std::vector<float> kick;
-            float kickFreq = 50.0f + (fillDist(rhythmGen) % 10);  // Leichte Pitch-Variation
-            synthesizeTone(kickFreq, 0.1f, sampleRate, kick);
+            // ✨ Nutze Kick-Drum-Modell
+            float kickFreq = 60.0f;  // Standard Kick-Frequenz
+            float kickDuration = 0.15f;
+            float velocity = (params.intensity == "hart") ? 0.9f : 0.7f;
             
-            float kickLevel = params.intensity == "hart" ? 0.7f : 0.5f;
+            auto kick = kickDrum->synthesize(kickFreq, kickDuration, velocity, sampleRate);
+            
             for (size_t j = 0; j < kick.size() && (position + j) < samples.size(); ++j) {
-                samples[position + j] += kick[j] * kickLevel;
+                samples[position + j] += kick[j] * 0.8f;
             }
         }
         
         // Snare (Beat 2 und 4)
         if (beat % 4 == 1 || beat % 4 == 3) {
-            std::vector<float> snare;
+            // ✨ Nutze Snare-Drum-Modell
+            float snareFreq = 200.0f;
+            float snareDuration = 0.12f;
+            float velocity = 0.8f;
             
-            // Snare = High-Freq Noise + Tone
-            std::random_device rd;
-            std::mt19937 gen(rd());
-            std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
-            
-            size_t snareLen = static_cast<size_t>(0.1f * sampleRate);
-            snare.resize(snareLen);
-            for (size_t i = 0; i < snareLen; ++i) {
-                snare[i] = dist(gen) * std::exp(-5.0f * i / snareLen);  // Decaying noise
-            }
+            auto snare = snareDrum->synthesize(snareFreq, snareDuration, velocity, sampleRate);
             
             for (size_t j = 0; j < snare.size() && (position + j) < samples.size(); ++j) {
-                samples[position + j] += snare[j] * 0.4f;
+                samples[position + j] += snare[j] * 0.6f;
             }
         }
         
         // Hi-Hat (Off-beats für Techno/Trap)
         if (params.genre == "Techno" || params.genre == "Trap" || params.genre == "Trance") {
             if (beat % 2 == 1) {
-                std::vector<float> hihat;
+                // ✨ Nutze HiHat-Modell
+                float hihatFreq = 10000.0f;
+                float hihatDuration = 0.05f;
+                float velocity = 0.4f + (fillDist(rhythmGen) % 20) * 0.01f;  // Leichte Variation
                 
-                std::random_device rd;
-                std::mt19937 gen(rd());
-                std::uniform_real_distribution<float> dist(-0.2f, 0.2f);
+                auto hihatSample = hihat->synthesize(hihatFreq, hihatDuration, velocity, sampleRate);
                 
-                size_t hihatLen = static_cast<size_t>(0.05f * sampleRate);
-                hihat.resize(hihatLen);
-                for (size_t i = 0; i < hihatLen; ++i) {
-                    hihat[i] = dist(gen) * std::exp(-10.0f * i / hihatLen);
-                }
-                
-                for (size_t j = 0; j < hihat.size() && (position + j) < samples.size(); ++j) {
-                    samples[position + j] += hihat[j] * 0.25f;
+                for (size_t j = 0; j < hihatSample.size() && (position + j) < samples.size(); ++j) {
+                    samples[position + j] += hihatSample[j] * 0.3f;
                 }
             }
         }

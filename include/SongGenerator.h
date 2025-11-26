@@ -3,6 +3,14 @@
 
 #include "MediaDatabase.h"
 #include "TrainingModel.h"
+#include "InstrumentModel.h"
+#include "ChordProgressionEngine.h"
+#include "RhythmEngine.h"
+#include "SongStructureEngine.h"
+#include "AudioEffects.h"
+#include "MIDIExporter.h"
+#include "BassLineEngine.h"
+#include "PatternCaptureEngine.h"
 #include <string>
 #include <vector>
 #include <map>
@@ -89,6 +97,9 @@ public:
     std::vector<MediaMetadata> selectSourceSamples(const GenerationParams& params, int count = 20);
     bool validateParams(const GenerationParams& params);
     
+    // Pattern Engine Access
+    SongGen::PatternCaptureEngine* getPatternEngine() { return patternEngine_.get(); }
+    
 private:
     MediaDatabase& db_;
     
@@ -99,6 +110,18 @@ private:
     // ML-Modell für Generation
     std::unique_ptr<TrainingModel> mlModel_;
     std::string modelPath_;
+    
+    // Instrument-Modelle
+    std::unique_ptr<InstrumentLibrary> instrumentLibrary_;
+    
+    // New AI Music Generation Systems
+    std::unique_ptr<SongGen::ChordProgressionEngine> chordEngine_;
+    std::unique_ptr<SongGen::RhythmEngine> rhythmEngine_;
+    std::unique_ptr<SongGen::SongStructureEngine> structureEngine_;
+    std::unique_ptr<SongGen::MixMasterEngine> mixMasterEngine_;
+    std::unique_ptr<SongGen::BassLineEngine> bassEngine_;
+    std::unique_ptr<SongGen::MIDIExporter> midiExporter_;
+    std::unique_ptr<SongGen::PatternCaptureEngine> patternEngine_;
     
     // Generierungs-Pipeline
     bool generateMelody(const GenerationParams& params, std::vector<float>& samples);

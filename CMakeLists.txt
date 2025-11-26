@@ -65,6 +65,15 @@ else()
     message(STATUS "RubberBand not found - using simple resampling")
 endif()
 
+# PortAudio for microphone capture
+pkg_check_modules(PORTAUDIO portaudio-2.0)
+if(PORTAUDIO_FOUND)
+    add_definitions(-DWITH_PORTAUDIO)
+    message(STATUS "PortAudio found - Microphone pattern capture enabled")
+else()
+    message(STATUS "PortAudio not found - Microphone capture disabled")
+endif()
+
 # ImGui
 set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/imgui_src)
 include_directories(${IMGUI_DIR} ${IMGUI_DIR}/backends)
@@ -76,6 +85,9 @@ include_directories(${SDL2_INCLUDE_DIRS})
 include_directories(${GTK3_INCLUDE_DIRS})
 include_directories(${SQLite3_INCLUDE_DIRS})
 include_directories(${CURL_INCLUDE_DIRS})
+if(PORTAUDIO_FOUND)
+    include_directories(${PORTAUDIO_INCLUDE_DIRS})
+endif()
 
 # ImGui sources
 set(IMGUI_SOURCES
@@ -95,6 +107,7 @@ set(SOURCES_IMGUI
     src/AudioAnalyzer.cpp
     src/AudioSegmenter.cpp
     src/InstrumentExtractor.cpp
+    src/InstrumentModel.cpp
     src/FileBrowser.cpp
     src/SongGenerator.cpp
     src/TrainingModel.cpp
@@ -102,6 +115,14 @@ set(SOURCES_IMGUI
     src/AudioPlayer.cpp
     src/ImGuiRenderer.cpp
     src/main_imgui.cpp
+    src/ChordProgressionEngine.cpp
+    src/RhythmEngine.cpp
+    src/SongStructureEngine.cpp
+    src/AudioEffects.cpp
+    src/MIDIExporter.cpp
+    src/BassLineEngine.cpp
+    src/PatternCaptureEngine.cpp
+    src/DataQualityAnalyzer.cpp
     ${IMGUI_SOURCES}
 )
 
@@ -113,6 +134,7 @@ set(SOURCES_GTK
     src/AudioAnalyzer.cpp
     src/AudioSegmenter.cpp
     src/InstrumentExtractor.cpp
+    src/InstrumentModel.cpp
     src/FileBrowser.cpp
     src/SongGenerator.cpp
     src/TrainingModel.cpp
@@ -120,6 +142,14 @@ set(SOURCES_GTK
     src/AudioPlayer.cpp
     src/GtkRenderer.cpp
     src/main_gtk.cpp
+    src/ChordProgressionEngine.cpp
+    src/RhythmEngine.cpp
+    src/SongStructureEngine.cpp
+    src/AudioEffects.cpp
+    src/MIDIExporter.cpp
+    src/BassLineEngine.cpp
+    src/PatternCaptureEngine.cpp
+    src/DataQualityAnalyzer.cpp
 )
 
 # Executables
@@ -130,6 +160,7 @@ add_executable(songgen-gtk ${SOURCES_GTK})
 target_link_libraries(songgen 
     ${SIDPLAYFP_LIBRARIES}
     ${SDL2_LIBRARIES}
+    ${PORTAUDIO_LIBRARIES}
     ${MPV_LIBRARIES}
     ${SQLite3_LIBRARIES}
     ${CURL_LIBRARIES}
@@ -143,6 +174,7 @@ target_link_libraries(songgen-gtk
     ${SIDPLAYFP_LIBRARIES}
     ${GTK3_LIBRARIES}
     ${SDL2_LIBRARIES}
+    ${PORTAUDIO_LIBRARIES}
     ${MPV_LIBRARIES}
     ${SQLite3_LIBRARIES}
     ${CURL_LIBRARIES}
